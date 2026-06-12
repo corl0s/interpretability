@@ -19,6 +19,11 @@ import tqdm
 from general_utils import decode_tokens
 from general_utils import make_inputs
 
+try:
+  from PIL import Image as PILImage
+except ImportError:
+  PILImage = None
+
 
 # ##############
 #
@@ -1153,5 +1158,570 @@ def evaluate_attriburte_exraction_batch(
         results[key] = np.concatenate((results[key], value))
       else:
         results[key] = value
+
+  return results
+
+
+# ##############
+#
+# VLM (LLaVA) Support
+#
+# ##############
+
+
+def set_hs_patch_hooks_llava(
+    model,
+    hs_patch_config,
+    module="hs",
+    patch_input=False,
+    skip_final_ln=False,
+    generation_mode=False,
+):
+  """LLaVA patch hooks (single-sample). Mirrors set_hs_patch_hooks_llama."""
+  # LLaVA's LLM backbone layers live at model.language_model.model.layers[i]
+  # instead of model.model.layers[i] used by bare LLaMA/Vicuna.
+
+  def patch_hs(name, position_hs, patch_input, generation_mode):
+    def pre_hook(module, input):
+      input_len = len(input[0][0])
+      if generation_mode and input_len == 1:
+        return
+      for position_, hs_ in position_hs:
+        input[0][0, position_] = hs_
+
+    def post_hook(module, input, output):
+      if "skip_ln" in name or "mlp" in name:
+        output_len = len(output[0])
+      else:
+        output_len = len(output[0][0])
+      if generation_mode and output_len == 1:
+        return
+      for position_, hs_ in position_hs:
+        if "skip_ln" in name or "mlp" in name:
+          output[0][position_] = hs_
+        else:
+          output[0][0, position_] = hs_
+
+    if patch_input:
+      return pre_hook
+    else:
+      return post_hook
+
+  llm_layers = model.language_model.model.layers
+  hooks = []
+  for i in hs_patch_config:
+    patch_hook = patch_hs(
+        f"patch_{module}_{i}",
+        position_hs=hs_patch_config[i],
+        patch_input=patch_input,
+        generation_mode=generation_mode,
+    )
+    if patch_input:
+      hooks.append(llm_layers[i].register_forward_pre_hook(patch_hook))
+    else:
+      if skip_final_ln and i == len(llm_layers) - 1 and module == "hs":
+        hooks.append(
+            model.language_model.model.norm.register_forward_hook(
+                patch_hs(
+                    f"patch_hs_{i}_skip_ln",
+                    hs_patch_config[i],
+                    patch_input,
+                    generation_mode,
+                )
+            )
+        )
+      else:
+        hooks.append(llm_layers[i].register_forward_hook(patch_hook))
+
+  return hooks
+
+
+def set_hs_patch_hooks_llava_batch(
+    model,
+    hs_patch_config,
+    module="hs",
+    patch_input=False,
+    generation_mode=False,
+):
+  """LLaVA patch hooks (batch). Mirrors set_hs_patch_hooks_llama_batch."""
+
+  if module != "hs":
+    raise ValueError("Module %s not yet supported", module)
+
+  def patch_hs(name, position_hs, patch_input, generation_mode):
+    def pre_hook(module, inp):
+      idx_, position_, hs_ = (
+          position_hs["batch_idx"],
+          position_hs["position_target"],
+          position_hs["hidden_rep"],
+      )
+      input_len = len(inp[0][idx_])
+      if generation_mode and input_len == 1:
+        return
+      inp[0][idx_][position_] = hs_
+
+    def post_hook(module, inp, output):
+      idx_, position_, hs_ = (
+          position_hs["batch_idx"],
+          position_hs["position_target"],
+          position_hs["hidden_rep"],
+      )
+      if "skip_ln" in name:
+        output_len = len(output[idx_])
+        if generation_mode and output_len == 1:
+          return
+        output[idx_][position_] = hs_
+      else:
+        output_len = len(output[0][idx_])
+        if generation_mode and output_len == 1:
+          return
+        output[0][idx_][position_] = hs_
+
+    if patch_input:
+      return pre_hook
+    else:
+      return post_hook
+
+  llm_layers = model.language_model.model.layers
+  hooks = []
+  for item in hs_patch_config:
+    i = item["layer_target"]
+    skip_final_ln = item["skip_final_ln"]
+    if patch_input:
+      hooks.append(
+          llm_layers[i].register_forward_pre_hook(
+              patch_hs(f"patch_hs_{i}", item, patch_input, generation_mode)
+          )
+      )
+    else:
+      if skip_final_ln and i == len(llm_layers) - 1:
+        hooks.append(
+            model.language_model.model.norm.register_forward_hook(
+                patch_hs(
+                    f"patch_hs_{i}_skip_ln", item, patch_input, generation_mode
+                )
+            )
+        )
+      else:
+        hooks.append(
+            llm_layers[i].register_forward_hook(
+                patch_hs(f"patch_hs_{i}", item, patch_input, generation_mode)
+            )
+        )
+
+  return hooks
+
+
+def get_hidden_state_vlm(mt, image, text_prompt, position, layer, modality="visual"):
+  """Extract a hidden state from a VLM forward pass.
+
+  Args:
+    mt: ModelAndTokenizer (VLM, mt.is_vlm must be True)
+    image: PIL Image — the source image
+    text_prompt: string — text part of the source prompt
+    position: int — patch index (0-575) for "visual"/"vit", or token index for "text"
+    layer: int — which layer to extract from (LLM backbone layer for "visual"/"text",
+                  ViT encoder layer for "vit")
+    modality: "visual" | "text" | "vit"
+
+  Returns:
+    Tensor of shape [hidden_dim]: the hidden state vector
+      - "visual" / "text": hidden_dim = LLM hidden dim (e.g. 4096)
+      - "vit": hidden_dim = ViT hidden dim (e.g. 1024 for CLIP-L)
+  """
+  if modality == "vit":
+    # Run vision tower only — returns pre-projector ViT representations (dim=1024)
+    pixel_values = mt.processor(
+        images=image, return_tensors="pt"
+    ).pixel_values.to(mt.device)
+    with torch.no_grad():
+      vit_outputs = mt.vision_tower(pixel_values, output_hidden_states=True)
+    return vit_outputs.hidden_states[layer][0, position, :]
+  else:
+    # Run full VLM forward pass to get LLM backbone hidden states
+    inputs = mt.processor(images=image, text=text_prompt, return_tensors="pt")
+    inputs = {k: v.to(mt.device) for k, v in inputs.items()}
+    with torch.no_grad():
+      outputs = mt.model(**inputs, output_hidden_states=True)
+    if modality == "visual":
+      # position is a patch index (0 to num_visual_tokens-1)
+      actual_position = mt.visual_token_start + position
+    else:
+      # modality == "text": position is a token index within the text portion
+      actual_position = mt.visual_token_start + mt.num_visual_tokens + position
+    # hidden_states[0] is the embedding layer output; [layer+1] is after layer `layer`
+    return outputs.hidden_states[layer + 1][0, actual_position, :]
+
+
+def inspect_vlm(
+    mt,
+    image,
+    prompt_source,
+    prompt_target,
+    layer_source,
+    layer_target,
+    position_source,
+    position_target,
+    modality="visual",
+    transform=None,
+    generation_mode=True,
+    max_gen_len=50,
+):
+  """Single-sample VLM patching: extract visual/text hidden state, inject into text target.
+
+  Args:
+    mt: ModelAndTokenizer (VLM)
+    image: PIL Image — source image
+    prompt_source: string — text prompt accompanying the image on the source side
+    prompt_target: string — text-only target/verbalization prompt
+    layer_source: int — LLM backbone layer to extract hidden state from
+    layer_target: int — LLM backbone layer to inject hidden state into
+    position_source: int — patch index (visual/vit) or text token index
+    position_target: int — token position in target prompt (-1 = last)
+    modality: "visual" | "text" | "vit"
+    transform: optional callable f: tensor → tensor (e.g. from build_vit_to_llm_mapping)
+    generation_mode: if True, generate text; if False, return next-token prediction
+    max_gen_len: max new tokens to generate
+
+  Returns:
+    str if generation_mode=True; (token_str, probability) if generation_mode=False
+  """
+  tokenizer = mt.processor.tokenizer
+
+  # Step 1: Extract hidden state from source (image + text)
+  h = get_hidden_state_vlm(
+      mt, image, prompt_source, position_source, layer_source, modality
+  )
+
+  # Step 2: Apply mapping function if provided
+  if transform is not None:
+    h = transform(h)
+
+  # Step 3: Tokenize text-only target prompt
+  inp_target = make_inputs(tokenizer, [prompt_target], mt.device)
+  if position_target < 0:
+    position_target = len(inp_target["input_ids"][0]) + position_target
+
+  # Step 4: Build patch config and attach hook
+  hs_patch_config = {layer_target: [(position_target, h)]}
+  skip_final_ln = (layer_source == layer_target == mt.num_layers - 1)
+  patch_hooks = set_hs_patch_hooks_llava(
+      mt.model,
+      hs_patch_config,
+      module="hs",
+      patch_input=False,
+      skip_final_ln=skip_final_ln,
+      generation_mode=True,
+  )
+
+  # Step 5: Run text-only forward pass through the LLM backbone
+  # (bypasses vision pipeline — target is always text-only)
+  llm = mt.model.language_model
+  if generation_mode:
+    output_toks = llm.generate(
+        inp_target["input_ids"],
+        attention_mask=inp_target["attention_mask"],
+        max_length=len(inp_target["input_ids"][0]) + max_gen_len,
+        pad_token_id=tokenizer.eos_token_id,
+    )[0][len(inp_target["input_ids"][0]):]
+    output = tokenizer.decode(output_toks, skip_special_tokens=True)
+  else:
+    out = llm(**inp_target)
+    answer_prob, answer_t = torch.max(
+        torch.softmax(out.logits[0, -1, :], dim=0), dim=0
+    )
+    output = tokenizer.decode([answer_t]), round(answer_prob.cpu().item(), 4)
+
+  remove_hooks(patch_hooks)
+  return output
+
+
+def build_vit_to_llm_mapping(mt, mode="projector"):
+  """Build a mapping function f: R^vit_dim -> R^llm_dim for cross-modal patching.
+
+  Used when modality="vit" to bridge the dimension gap between pre-projector
+  ViT hidden states (1024-dim for CLIP-L) and LLM token space (4096-dim).
+
+  Args:
+    mt: ModelAndTokenizer (VLM)
+    mode:
+      "projector" — use the VLM's own MLP projector (no training required)
+      "affine"    — return None; caller fits a linear map via np.linalg.lstsq
+                    using (vit_hidden_states, llm_hidden_states) pairs
+
+  Returns:
+    Callable f(h: tensor) -> tensor, or None for mode="affine"
+  """
+  if mode == "projector":
+    projector = mt.projector
+
+    def f(h):
+      with torch.no_grad():
+        return projector(h.unsqueeze(0)).squeeze(0)
+
+    return f
+  elif mode == "affine":
+    # Caller builds the affine using:
+    #   A, _, _, _ = np.linalg.lstsq(source_vecs, target_vecs, rcond=None)
+    #   transform = lambda h: torch.tensor(h.cpu().numpy() @ A).to(h.device)
+    return None
+  else:
+    raise ValueError(f"Unknown mode '{mode}'. Choose 'projector' or 'affine'.")
+
+
+def evaluate_visual_attribute_extraction_batch(
+    mt,
+    df,
+    batch_size=64,
+    max_gen_len=10,
+    transform=None,
+):
+  """Batch visual attribute extraction: patch visual token hidden states into text targets.
+
+  DataFrame columns required:
+    image_path       (str)  path to source image
+    prompt_source    (str)  text prompt paired with the image on source side
+    prompt_target    (str)  text-only verbalization/target prompt
+    position_source  (int)  patch index (0-575) or text token index
+    position_target  (int)  token position in target prompt (-1 = last)
+    layer_source     (int)  LLM backbone layer to extract hidden state from
+    layer_target     (int)  LLM backbone layer to inject into
+    modality         (str)  "visual", "text", or "vit"
+    ground_truth     (str)  expected attribute value for scoring
+
+  Returns:
+    dict with keys: generations, is_correct, hidden_rep
+  """
+  tokenizer = mt.processor.tokenizer
+
+  def _process_single_batch(batch_df):
+    n = len(batch_df)
+    prompt_target_batch = list(batch_df["prompt_target"])
+    layer_source_batch = np.array(batch_df["layer_source"])
+    layer_target_batch = np.array(batch_df["layer_target"])
+    position_source_batch = np.array(batch_df["position_source"])
+    position_target_batch = np.array(batch_df["position_target"])
+    modality_batch = list(batch_df["modality"])
+    ground_truth_batch = list(batch_df["ground_truth"])
+
+    # Tokenize text-only target prompts
+    inp_target = make_inputs(tokenizer, prompt_target_batch, mt.device)
+    for i in range(n):
+      if position_target_batch[i] < 0:
+        position_target_batch[i] += len(inp_target["input_ids"][i])
+
+    # Extract hidden states one image at a time (images differ per sample)
+    hidden_rep = []
+    for i in range(n):
+      image = PILImage.open(batch_df["image_path"].iloc[i]).convert("RGB")
+      h = get_hidden_state_vlm(
+          mt, image,
+          batch_df["prompt_source"].iloc[i],
+          int(position_source_batch[i]),
+          int(layer_source_batch[i]),
+          modality_batch[i],
+      )
+      if transform is not None:
+        h = transform(h)
+      hidden_rep.append(h)
+
+    # Build batch patch config and run batched text forward pass
+    hs_patch_config = [
+        {
+            "batch_idx": i,
+            "layer_target": int(layer_target_batch[i]),
+            "position_target": int(position_target_batch[i]),
+            "hidden_rep": hidden_rep[i],
+            "skip_final_ln": (
+                int(layer_source_batch[i])
+                == int(layer_target_batch[i])
+                == mt.num_layers - 1
+            ),
+        }
+        for i in range(n)
+    ]
+    patch_hooks = set_hs_patch_hooks_llava_batch(
+        mt.model, hs_patch_config, module="hs",
+        patch_input=False, generation_mode=True,
+    )
+
+    seq_len = len(inp_target["input_ids"][0])
+    output_toks = mt.model.language_model.generate(
+        inp_target["input_ids"],
+        attention_mask=inp_target["attention_mask"],
+        max_length=seq_len + max_gen_len,
+        pad_token_id=tokenizer.eos_token_id,
+    )[:, seq_len:]
+
+    generations = [
+        tokenizer.decode(output_toks[i], skip_special_tokens=True)
+        for i in range(n)
+    ]
+    is_correct = np.array([
+        ground_truth_batch[i].lower().replace(" ", "")
+        in generations[i].lower().replace(" ", "")
+        for i in range(n)
+    ])
+
+    remove_hooks(patch_hooks)
+
+    cpu_hidden_rep = np.array(
+        [hidden_rep[i].detach().cpu().numpy() for i in range(n)]
+    )
+    return {"generations": generations, "is_correct": is_correct,
+            "hidden_rep": cpu_hidden_rep}
+
+  results = {}
+  n_batches = (len(df) + batch_size - 1) // batch_size
+  for i in tqdm.tqdm(range(n_batches)):
+    cur_df = df.iloc[batch_size * i: batch_size * (i + 1)]
+    if len(cur_df) == 0:
+      continue
+    batch_results = _process_single_batch(cur_df)
+    for key, value in batch_results.items():
+      if key in results:
+        if isinstance(value, np.ndarray):
+          results[key] = np.concatenate((results[key], value))
+        else:
+          results[key].extend(value)
+      else:
+        results[key] = value if isinstance(value, np.ndarray) else list(value)
+
+  return results
+
+
+def evaluate_visual_entity_resolution_batch(
+    mt,
+    df,
+    batch_size=64,
+    max_gen_len=20,
+    transform=None,
+):
+  """Batch visual concept crystallization: measure RougeL of generated descriptions.
+
+  Analogue of the text entity_processing experiment (§4.3) but for image patches.
+  Tracks how a visual patch token's representation evolves across LLM backbone layers
+  by patching into the entity description target prompt and scoring against a reference.
+
+  DataFrame columns required:
+    image_path             (str)  path to source image
+    prompt_source          (str)  text prompt paired with the image
+    prompt_target          (str)  entity description target prompt
+                                  e.g. "Syria: Country in the Middle East, x:"
+    position_source        (int)  patch index (0-575)
+    position_target        (int)  token position of placeholder in target (-1 = last)
+    layer_source           (int)  LLM backbone layer to extract from
+    layer_target           (int)  LLM backbone layer to inject into
+    modality               (str)  "visual", "text", or "vit"
+    reference_description  (str)  ground truth description for RougeL scoring
+                                  (e.g. COCO caption or Visual Genome region description)
+
+  Returns:
+    dict with keys: generations, rouge_l, rouge_1, hidden_rep
+  """
+  try:
+    from rouge_score import rouge_scorer as rouge_scorer_lib
+    scorer = rouge_scorer_lib.RougeScorer(["rougeL", "rouge1"], use_stemmer=True)
+  except ImportError:
+    raise ImportError("rouge_score required: pip install rouge-score")
+
+  tokenizer = mt.processor.tokenizer
+
+  def _process_single_batch(batch_df):
+    n = len(batch_df)
+    prompt_target_batch = list(batch_df["prompt_target"])
+    layer_source_batch = np.array(batch_df["layer_source"])
+    layer_target_batch = np.array(batch_df["layer_target"])
+    position_source_batch = np.array(batch_df["position_source"])
+    position_target_batch = np.array(batch_df["position_target"])
+    modality_batch = list(batch_df["modality"])
+    reference_batch = list(batch_df["reference_description"])
+
+    inp_target = make_inputs(tokenizer, prompt_target_batch, mt.device)
+    for i in range(n):
+      if position_target_batch[i] < 0:
+        position_target_batch[i] += len(inp_target["input_ids"][i])
+
+    # Extract hidden states one image at a time
+    hidden_rep = []
+    for i in range(n):
+      image = PILImage.open(batch_df["image_path"].iloc[i]).convert("RGB")
+      h = get_hidden_state_vlm(
+          mt, image,
+          batch_df["prompt_source"].iloc[i],
+          int(position_source_batch[i]),
+          int(layer_source_batch[i]),
+          modality_batch[i],
+      )
+      if transform is not None:
+        h = transform(h)
+      hidden_rep.append(h)
+
+    hs_patch_config = [
+        {
+            "batch_idx": i,
+            "layer_target": int(layer_target_batch[i]),
+            "position_target": int(position_target_batch[i]),
+            "hidden_rep": hidden_rep[i],
+            "skip_final_ln": (
+                int(layer_source_batch[i])
+                == int(layer_target_batch[i])
+                == mt.num_layers - 1
+            ),
+        }
+        for i in range(n)
+    ]
+    patch_hooks = set_hs_patch_hooks_llava_batch(
+        mt.model, hs_patch_config, module="hs",
+        patch_input=False, generation_mode=True,
+    )
+
+    seq_len = len(inp_target["input_ids"][0])
+    output_toks = mt.model.language_model.generate(
+        inp_target["input_ids"],
+        attention_mask=inp_target["attention_mask"],
+        max_length=seq_len + max_gen_len,
+        pad_token_id=tokenizer.eos_token_id,
+    )[:, seq_len:]
+
+    generations = [
+        tokenizer.decode(output_toks[i], skip_special_tokens=True)
+        for i in range(n)
+    ]
+
+    remove_hooks(patch_hooks)
+
+    rouge_l_scores = []
+    rouge_1_scores = []
+    for i in range(n):
+      scores = scorer.score(reference_batch[i], generations[i])
+      rouge_l_scores.append(scores["rougeL"].fmeasure)
+      rouge_1_scores.append(scores["rouge1"].fmeasure)
+
+    cpu_hidden_rep = np.array(
+        [hidden_rep[i].detach().cpu().numpy() for i in range(n)]
+    )
+    return {
+        "generations": generations,
+        "rouge_l": np.array(rouge_l_scores),
+        "rouge_1": np.array(rouge_1_scores),
+        "hidden_rep": cpu_hidden_rep,
+    }
+
+  results = {}
+  n_batches = (len(df) + batch_size - 1) // batch_size
+  for i in tqdm.tqdm(range(n_batches)):
+    cur_df = df.iloc[batch_size * i: batch_size * (i + 1)]
+    if len(cur_df) == 0:
+      continue
+    batch_results = _process_single_batch(cur_df)
+    for key, value in batch_results.items():
+      if key in results:
+        if isinstance(value, np.ndarray):
+          results[key] = np.concatenate((results[key], value))
+        else:
+          results[key].extend(value)
+      else:
+        results[key] = value if isinstance(value, np.ndarray) else list(value)
 
   return results

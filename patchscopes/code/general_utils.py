@@ -38,27 +38,72 @@ class ModelAndTokenizer:
       use_fast=True,
       device="cuda",
       ):
-    if tokenizer is None:
-      assert model_name is not None
-      tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, use_fast=use_fast)
-    if model is None:
-      assert model_name is not None
-      model = transformers.AutoModelForCausalLM.from_pretrained(
-          model_name, low_cpu_mem_usage=low_cpu_mem_usage,
-          torch_dtype=torch_dtype
-          )
-      if device is not None:
-        model.to(device)
-      set_requires_grad(False, model)
-      model.eval()
-    self.tokenizer = tokenizer
-    self.model = model
-    self.device = device
-    self.layer_names = [
-        n
-        for n, _ in model.named_modules()
-        if (re.match(r"^(transformer|gpt_neox|model)\.(h|layers)\.\d+$", n))
-    ]
+    is_vlm = (
+        model_name is not None and "llava" in model_name.lower()
+    ) or (
+        model is not None and "llava" in type(model).__name__.lower()
+    )
+
+    if is_vlm:
+      from transformers import LlavaForConditionalGeneration, LlavaProcessor
+      if tokenizer is None:
+        assert model_name is not None
+        processor = LlavaProcessor.from_pretrained(model_name)
+        tokenizer = processor.tokenizer
+      else:
+        processor = None
+      if model is None:
+        assert model_name is not None
+        model = LlavaForConditionalGeneration.from_pretrained(
+            model_name, low_cpu_mem_usage=low_cpu_mem_usage,
+            torch_dtype=torch_dtype
+        )
+        if device is not None:
+          model.to(device)
+        set_requires_grad(False, model)
+        model.eval()
+      self.tokenizer = tokenizer
+      self.model = model
+      self.device = device
+      self.processor = processor
+      self.is_vlm = True
+      self.num_visual_tokens = 576
+      self.visual_token_start = 1
+      self.vision_tower = model.vision_tower
+      self.projector = model.multi_modal_projector
+      self.num_vision_layers = len([
+          n for n, _ in model.vision_tower.named_modules()
+          if re.match(r".*encoder\.layers\.\d+$", n)
+      ])
+      self.layer_names = [
+          n for n, _ in model.named_modules()
+          if re.match(r"^language_model\.model\.layers\.\d+$", n)
+      ]
+    else:
+      if tokenizer is None:
+        assert model_name is not None
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, use_fast=use_fast)
+      if model is None:
+        assert model_name is not None
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_name, low_cpu_mem_usage=low_cpu_mem_usage,
+            torch_dtype=torch_dtype
+        )
+        if device is not None:
+          model.to(device)
+        set_requires_grad(False, model)
+        model.eval()
+      self.tokenizer = tokenizer
+      self.model = model
+      self.device = device
+      self.processor = None
+      self.is_vlm = False
+      self.layer_names = [
+          n
+          for n, _ in model.named_modules()
+          if (re.match(r"^(transformer|gpt_neox|model)\.(h|layers)\.\d+$", n))
+      ]
+
     self.num_layers = len(self.layer_names)
 
   def __repr__(self):
@@ -131,3 +176,8 @@ def set_requires_grad(requires_grad, *models):
       model.requires_grad = requires_grad
     else:
       assert False, "unknown type %r" % type(model)
+
+
+def get_visual_token_position(mt, patch_index):
+  """Return the absolute token position of a visual patch in the LLM sequence."""
+  return mt.visual_token_start + patch_index
