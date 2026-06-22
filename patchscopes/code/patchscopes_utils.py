@@ -1194,14 +1194,18 @@ def set_hs_patch_hooks_llava(
       if "skip_ln" in name or "mlp" in name:
         output_len = len(output[0])
       else:
-        output_len = len(output[0][0])
+        # transformers >= 4.5x: decoder layers return the hidden_states
+        # tensor directly, not wrapped in a tuple like older versions did.
+        hs_tensor = output[0] if isinstance(output, tuple) else output
+        output_len = len(hs_tensor[0])
       if generation_mode and output_len == 1:
         return
       for position_, hs_ in position_hs:
         if "skip_ln" in name or "mlp" in name:
           output[0][position_] = hs_
         else:
-          output[0][0, position_] = hs_
+          hs_tensor = output[0] if isinstance(output, tuple) else output
+          hs_tensor[0, position_] = hs_
 
     if patch_input:
       return pre_hook
@@ -1273,10 +1277,13 @@ def set_hs_patch_hooks_llava_batch(
           return
         output[idx_][position_] = hs_
       else:
-        output_len = len(output[0][idx_])
+        # transformers >= 4.5x: decoder layers return the hidden_states
+        # tensor directly, not wrapped in a tuple like older versions did.
+        hs_tensor = output[0] if isinstance(output, tuple) else output
+        output_len = len(hs_tensor[idx_])
         if generation_mode and output_len == 1:
           return
-        output[0][idx_][position_] = hs_
+        hs_tensor[idx_][position_] = hs_
 
     if patch_input:
       return pre_hook
