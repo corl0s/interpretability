@@ -69,15 +69,19 @@ class ModelAndTokenizer:
       self.is_vlm = True
       self.num_visual_tokens = 576
       self.visual_token_start = 1
-      self.vision_tower = model.vision_tower
-      self.projector = model.multi_modal_projector
+      # transformers >= 4.5x nests vision_tower / multi_modal_projector /
+      # language_model under model.model (LlavaModel base), with
+      # LlavaForConditionalGeneration only adding lm_head on top. The
+      # nested language_model is the bare decoder (no lm_head of its own).
+      self.vision_tower = model.model.vision_tower
+      self.projector = model.model.multi_modal_projector
       self.num_vision_layers = len([
-          n for n, _ in model.vision_tower.named_modules()
+          n for n, _ in model.model.vision_tower.named_modules()
           if re.match(r".*encoder\.layers\.\d+$", n)
       ])
       self.layer_names = [
           n for n, _ in model.named_modules()
-          if re.match(r"^language_model\.model\.layers\.\d+$", n)
+          if re.match(r"^model\.language_model\.layers\.\d+$", n)
       ]
     else:
       if tokenizer is None:

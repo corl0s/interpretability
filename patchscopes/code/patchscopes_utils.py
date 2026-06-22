@@ -1178,8 +1178,9 @@ def set_hs_patch_hooks_llava(
     generation_mode=False,
 ):
   """LLaVA patch hooks (single-sample). Mirrors set_hs_patch_hooks_llama."""
-  # LLaVA's LLM backbone layers live at model.language_model.model.layers[i]
-  # instead of model.model.layers[i] used by bare LLaMA/Vicuna.
+  # LLaVA's LLM backbone layers live at model.model.language_model.layers[i]
+  # (transformers >= 4.5x nests vision_tower/projector/language_model under
+  # model.model, and language_model is the bare decoder with no lm_head).
 
   def patch_hs(name, position_hs, patch_input, generation_mode):
     def pre_hook(module, input):
@@ -1207,7 +1208,7 @@ def set_hs_patch_hooks_llava(
     else:
       return post_hook
 
-  llm_layers = model.language_model.model.layers
+  llm_layers = model.model.language_model.layers
   hooks = []
   for i in hs_patch_config:
     patch_hook = patch_hs(
@@ -1221,7 +1222,7 @@ def set_hs_patch_hooks_llava(
     else:
       if skip_final_ln and i == len(llm_layers) - 1 and module == "hs":
         hooks.append(
-            model.language_model.model.norm.register_forward_hook(
+            model.model.language_model.norm.register_forward_hook(
                 patch_hs(
                     f"patch_hs_{i}_skip_ln",
                     hs_patch_config[i],
@@ -1282,7 +1283,7 @@ def set_hs_patch_hooks_llava_batch(
     else:
       return post_hook
 
-  llm_layers = model.language_model.model.layers
+  llm_layers = model.model.language_model.layers
   hooks = []
   for item in hs_patch_config:
     i = item["layer_target"]
@@ -1296,7 +1297,7 @@ def set_hs_patch_hooks_llava_batch(
     else:
       if skip_final_ln and i == len(llm_layers) - 1:
         hooks.append(
-            model.language_model.model.norm.register_forward_hook(
+            model.model.language_model.norm.register_forward_hook(
                 patch_hs(
                     f"patch_hs_{i}_skip_ln", item, patch_input, generation_mode
                 )
@@ -1414,19 +1415,22 @@ def inspect_vlm(
       generation_mode=True,
   )
 
-  # Step 5: Run text-only forward pass through the LLM backbone
-  # (bypasses vision pipeline — target is always text-only)
-  llm = mt.model.language_model
+  # Step 5: Run text-only forward pass through the full VLM wrapper
+  # (NOT mt.model.language_model directly — in transformers >= 4.5x that's
+  # the bare decoder with no lm_head/generate(). Omitting pixel_values makes
+  # mt.model run as a plain text decoder, still using its own lm_head, while
+  # the patch hooks attached to model.model.language_model.layers[i] still
+  # fire identically regardless of which wrapper initiates the forward pass.)
   if generation_mode:
-    output_toks = llm.generate(
-        inp_target["input_ids"],
+    output_toks = mt.model.generate(
+        input_ids=inp_target["input_ids"],
         attention_mask=inp_target["attention_mask"],
         max_length=len(inp_target["input_ids"][0]) + max_gen_len,
         pad_token_id=tokenizer.eos_token_id,
     )[0][len(inp_target["input_ids"][0]):]
     output = tokenizer.decode(output_toks, skip_special_tokens=True)
   else:
-    out = llm(**inp_target)
+    out = mt.model(**inp_target)
     answer_prob, answer_t = torch.max(
         torch.softmax(out.logits[0, -1, :], dim=0), dim=0
     )
@@ -1546,8 +1550,11 @@ def evaluate_visual_attribute_extraction_batch(
     )
 
     seq_len = len(inp_target["input_ids"][0])
-    output_toks = mt.model.language_model.generate(
-        inp_target["input_ids"],
+    # mt.model (full LlavaForConditionalGeneration), not .language_model:
+    # the bare decoder under transformers >= 4.5x has no lm_head/generate().
+    # Omitting pixel_values runs it as a plain text decoder.
+    output_toks = mt.model.generate(
+        input_ids=inp_target["input_ids"],
         attention_mask=inp_target["attention_mask"],
         max_length=seq_len + max_gen_len,
         pad_token_id=tokenizer.eos_token_id,
@@ -1677,8 +1684,11 @@ def evaluate_visual_entity_resolution_batch(
     )
 
     seq_len = len(inp_target["input_ids"][0])
-    output_toks = mt.model.language_model.generate(
-        inp_target["input_ids"],
+    # mt.model (full LlavaForConditionalGeneration), not .language_model:
+    # the bare decoder under transformers >= 4.5x has no lm_head/generate().
+    # Omitting pixel_values runs it as a plain text decoder.
+    output_toks = mt.model.generate(
+        input_ids=inp_target["input_ids"],
         attention_mask=inp_target["attention_mask"],
         max_length=seq_len + max_gen_len,
         pad_token_id=tokenizer.eos_token_id,
