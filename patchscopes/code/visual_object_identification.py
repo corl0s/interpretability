@@ -491,8 +491,7 @@ def run_probe(states_tensor, meta_df, layers, args):
     X = states_tensor[idx, layer].float().numpy()
     preds = np.empty_like(y)
     for train, test in GroupKFold(n_splits=n_splits).split(X, y, groups):
-      clf = make_pipeline(StandardScaler(),
-                          LogisticRegression(max_iter=2000, multi_class="auto"))
+      clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000))
       clf.fit(X[train], y[train])
       preds[test] = clf.predict(X[test])
     records.append({"layer": layer, "probe_accuracy": float((preds == y).mean())})
