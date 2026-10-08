@@ -222,8 +222,13 @@ def plot(summary, out_dir, main_readouts, prefix=""):
 
   # 3. Single token vs pooled, per readout (small multiples).
   n = len(main_readouts)
-  fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.6), sharey=True)
-  axes = np.atleast_1d(axes)
+  ncols = min(4, n)
+  nrows = int(np.ceil(n / ncols))
+  fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.6 * nrows), sharey=True,
+                           squeeze=False)
+  for ax in axes.flat[n:]:
+    ax.set_visible(False)
+  axes = list(axes.flat)
   for ax, r in zip(axes, main_readouts):
     g = top1[top1.readout == r]
     for cond, ls, label in (("object_high", "-", "single token"),

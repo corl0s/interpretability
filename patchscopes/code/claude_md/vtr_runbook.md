@@ -23,6 +23,9 @@ Script: `run_vtr.py` · Package: `vtr/` · Test: `test_vtr.py`
    | `latentlens`, `latentlens_syn` | max cosine to bank entries whose word names the class; uses the LLaVA bank in `results/latentlens_index/bank` |
    | `patchscopes_raw`, `patchscopes_pmi` | inject into the identity prompt (`... ?`) and score the continuation `" -> <class>"`. PMI subtracts the no-injection score, because the prompt itself favours some words (it contains "cat") |
    | `probe_linear`, `probe_mlp` | supervised references (availability), 5 folds with images grouped |
+   | `tuned_lens` | logit lens after per-layer affine translators trained on **text** by `train_tuned_lens.py` (Belrose et al. 2023; KL to the model's final distribution) |
+   | `embedding_lens` | max cosine to the **input** embedding of the class's first sub-token (LatentLens's EmbeddingLens) |
+   | `selfie_raw`, `selfie_pmi` | SelfIE-style prompt `USER: _ _ _ _ _\nASSISTANT: Sure, I'll summarize your message:`, state injected at all five `_`, continuation `" <class>"`. Same-layer injection and closed-set scoring, unlike the original SelfIE |
 4. **eval:**
    - top-1 / top-5 per layer and condition, with image-clustered 95% CIs
    - conditions: `object_high` (≥ 50%), each overlap bin, pooled mean/max, and the controls `outside`, `random` and `shuffled` (another image's label)
@@ -51,6 +54,27 @@ python run_vtr.py --coco_dir /projectnb/mlresearch/vishnuav/coco
 ```
 
 Stages are checkpointed in `--out_dir` (`samples.json`, `states.pt`, `scores/*.npz`). Re-running skips anything finished, so a job that times out can simply be resubmitted. To run one stage only, use `--stage readouts`, or `--readouts probe` for one readout.
+
+## Adding the extra baselines to an existing run
+
+Finished readouts are skipped, so the new ones can be added to `results/vtr_llava15` without
+recomputing anything:
+
+```bash
+# 1. train the tuned lens on text (~0.5-1 h on one GPU; needs ~25 GB GPU memory)
+python train_tuned_lens.py --out ./results/tuned_lens/llava15_tuned_lens.pt
+#    check the printed held-out KL: tuned lens < logit lens at every layer except 31 (equal)
+
+# 2. tuned lens + embedding lens on all layers (minutes)
+python run_vtr.py --out_dir ./results/vtr_llava15 --stage readouts --readouts tuned_lens embedding_lens
+
+# 3. SelfIE prompt on the same layers as Patchscopes (~2.5 h)
+python run_vtr.py --out_dir ./results/vtr_llava15 --stage readouts --readouts selfie \
+    --layers 0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --ps_rows_per_batch 512
+
+# 4. re-evaluate everything
+python run_vtr.py --out_dir ./results/vtr_llava15 --stage eval
+```
 
 ## Cost knobs
 - **Patchscopes** dominates: 80 continuations per injected state × ~13k rows × 32 layers. Options:

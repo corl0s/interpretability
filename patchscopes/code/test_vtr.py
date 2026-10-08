@@ -28,13 +28,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import latentlens_object_identification as LL  # noqa: E402
 import run_vtr  # noqa: E402
+import train_tuned_lens as T  # noqa: E402
 from test_visual_object_identification import build_tiny_vlm, make_fake_coco  # noqa: E402
 from vtr import evaluate as E  # noqa: E402
 from vtr.cache import cache_states  # noqa: E402
 from vtr.data import select_object_samples  # noqa: E402
 from vtr.geometry import Llava15Geometry, sample_tokens  # noqa: E402
-from vtr.readouts import (LatentLens, LogitLens, Patchscopes, class_forms,  # noqa: E402
-                          probe_scores)
+from visual_object_identification import class_token_ids  # noqa: E402
+from vtr.readouts import (EmbeddingLens, LatentLens, LogitLens, Patchscopes,  # noqa: E402
+                          TunedLens, class_forms, probe_scores)
 
 
 def test_forms_and_ranks():
@@ -107,7 +109,48 @@ def test_patchscopes(mt, class_names, states):
                      atol=1e-3)
   assert not np.allclose(raw_fast[0], fast.prior.numpy()[:len(class_names)], atol=1e-4), \
       "injection had no effect"
-  print("patchscopes OK (cached scoring == full-sequence scoring)")
+
+  # SelfIE-style prompt: five injection positions, same equivalence.
+  sf = Patchscopes(mt, class_names, forms, "selfie", "cpu", rows_per_batch=8)
+  ss = Patchscopes(mt, class_names, forms, "selfie", "cpu", rows_per_batch=8, use_cache=False)
+  assert len(sf.pos) == 5, sf.pos
+  r1, _ = sf.scores(h, 2)
+  r2, _ = ss.scores(h, 2)
+  assert np.allclose(r1, r2, atol=1e-3), (r1, r2)
+  assert not np.allclose(r1[0], sf.prior.numpy()[:len(class_names)], atol=1e-4)
+  print("patchscopes + selfie OK (cached scoring == full-sequence scoring)")
+
+
+def test_lenses(mt, class_names, states, tmp):
+  forms = class_forms(class_names, synonyms=False)
+  # Embedding lens: the input embedding of a class's first sub-token scores that class highest.
+  emb_lens = EmbeddingLens(mt, class_names, forms, "cpu")
+  dog_id = sorted(class_token_ids(mt.tokenizer, "dog"))[0]
+  q = mt.model.get_input_embeddings().weight[dog_id:dog_id + 1].detach().float() * 5
+  s = emb_lens.scores(q)
+  assert class_names[int(s.argmax())] == "dog" and s[0].max() > 0.999, s
+
+  # Tuned lens: training lowers held-out KL; zero translators reproduce the logit lens.
+  corpus = os.path.join(tmp, "corpus.txt")
+  with open(corpus, "w", encoding="utf-8") as f:
+    f.write("\n".join(f"Sentence number {i} is about a dog, a cat and a bottle." for i in range(60)))
+  out = os.path.join(tmp, "tl", "lens.pt")
+  T.main(["--corpus", corpus, "--out", out, "--steps", "30", "--batch_size", "4",
+          "--tokens_per_step", "64", "--lr", "1e-2", "--warmup", "1", "--log_every", "10",
+          "--eval_fraction", "0.2", "--device", "cpu"], mt=mt)
+  saved = torch.load(out, weights_only=False)
+  kl_lens, kl_tuned = np.array(saved["kl_logit_lens"]), np.array(saved["kl_tuned_lens"])
+  assert kl_tuned[:-1].mean() < kl_lens[:-1].mean(), (kl_lens, kl_tuned)
+  assert saved["A"].shape == (4, 64, 64)
+
+  zero = os.path.join(tmp, "tl", "zero.pt")
+  torch.save({"A": torch.zeros(4, 64, 64), "b": torch.zeros(4, 64)}, zero)
+  h = states[:, 1].float()
+  assert np.allclose(TunedLens(mt, class_names, forms, "cpu", zero).scores(h, 1),
+                     LogitLens(mt, class_names, forms, "cpu").scores(h), atol=1e-4)
+  print(f"embedding lens + tuned lens OK (mean held-out KL {kl_lens[:-1].mean():.3f} -> "
+        f"{kl_tuned[:-1].mean():.3f})")
+  return out
 
 
 def test_latentlens(mt, class_names, tmp):
@@ -163,6 +206,7 @@ def main():
     print(f"cache OK {tuple(states.shape)} {kinds}")
 
     test_patchscopes(mt, class_names, states)
+    tuned_path = test_lenses(mt, class_names, states, tmp)
     bank_dir = test_latentlens(mt, class_names, tmp)
 
     lens = LogitLens(mt, class_names, class_forms(class_names, False), "cpu")
@@ -178,14 +222,18 @@ def main():
     os.makedirs(out_dir)
     args = run_vtr.parse_args(["--out_dir", out_dir, "--device", "cpu",
                                "--latentlens_bank", bank_dir, "--n_boot", "50",
+                               "--tuned_lens", tuned_path,
+                               "--readouts", "logit_lens", "tuned_lens", "embedding_lens",
+                               "latentlens", "patchscopes", "selfie", "probe",
                                "--ps_rows_per_batch", "16", "--ps_max_images", "2",
                                "--probe_splits", "2"])
     layers = [0, 1, 2, 3]
     run_vtr.run_readouts(args, mt, states, meta, class_names, layers)
     names = sorted(f[:-4] for f in os.listdir(os.path.join(out_dir, "scores"))
                    if f.endswith(".npz") and not f.endswith("_entries.npz"))
-    assert names == ["latentlens", "latentlens_syn", "logit_lens", "logit_lens_syn",
-                     "patchscopes_pmi", "patchscopes_raw", "probe_linear", "probe_mlp"], names
+    assert names == ["embedding_lens", "latentlens", "latentlens_syn", "logit_lens",
+                     "logit_lens_syn", "patchscopes_pmi", "patchscopes_raw", "probe_linear",
+                     "probe_mlp", "selfie_pmi", "selfie_raw", "tuned_lens"], names
     scores = {n: run_vtr.load_scores(os.path.join(out_dir, "scores", f"{n}.npz"))
               for n in names}
     summary = E.evaluate(scores, meta, class_names, 50, 0)

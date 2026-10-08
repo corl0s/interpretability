@@ -10,9 +10,16 @@ Stages (each checkpointed in --out_dir; re-runs skip finished stages unless --ov
 
 Readout names in the outputs:
   logit_lens, logit_lens_syn         class name only / with unambiguous synonyms
+  tuned_lens                         logit lens after learned per-layer translators
+                                     (train them first with train_tuned_lens.py)
+  embedding_lens                     nearest input embedding (LatentLens's EmbeddingLens)
   latentlens, latentlens_syn         same two variants (needs a LatentLens bank for LLaVA)
   patchscopes_raw, patchscopes_pmi   continuation log-likelihood; PMI subtracts the prompt prior
+  selfie_raw, selfie_pmi             the same with the SelfIE-style prompt (5 placeholders)
   probe_linear, probe_mlp            supervised references (availability)
+
+  --readouts picks which to compute: logit_lens tuned_lens embedding_lens latentlens
+  patchscopes selfie probe (finished ones are skipped, so new ones can be added later).
 
 Usage on SCC (one GPU):
   # smoke run
@@ -38,13 +45,16 @@ from vtr import evaluate as E  # noqa: E402
 from vtr.cache import cache_states  # noqa: E402
 from vtr.data import select_object_samples, summarize_samples  # noqa: E402
 from vtr.geometry import GEOMETRIES  # noqa: E402
-from vtr.readouts import (LatentLens, LogitLens, Patchscopes, class_forms,  # noqa: E402
-                          probe_scores)
+from vtr.readouts import (EmbeddingLens, LatentLens, LogitLens, Patchscopes,  # noqa: E402
+                          TunedLens, class_forms, probe_scores)
 
-MAIN_READOUTS = ["logit_lens", "latentlens", "patchscopes_pmi", "probe_linear"]
-# Readouts whose class coverage defines the fair subset (the probe is a supervised reference).
-# patchscopes_pmi is the main Patchscopes number, fixed before looking at results.
-TRAINING_FREE = ["logit_lens", "latentlens", "patchscopes_pmi"]
+MAIN_READOUTS = ["logit_lens", "tuned_lens", "embedding_lens", "latentlens", "patchscopes_pmi",
+                 "selfie_pmi", "probe_linear"]
+# Readouts whose class coverage defines the fair subset (the probe is a supervised reference;
+# the tuned lens is trained on text only, never on images, so it counts as a readout here).
+# The *_pmi variants are the main injection numbers, fixed before looking at results.
+TRAINING_FREE = ["logit_lens", "tuned_lens", "embedding_lens", "latentlens", "patchscopes_pmi",
+                 "selfie_pmi"]
 
 
 def parse_args(argv=None):
@@ -66,9 +76,13 @@ def parse_args(argv=None):
   p.add_argument("--n_outside", type=int, default=2)
   # readouts
   p.add_argument("--readouts", nargs="+", default=["logit_lens", "latentlens", "patchscopes",
-                                                   "probe"])
+                                                   "probe"],
+                 choices=["logit_lens", "tuned_lens", "embedding_lens", "latentlens",
+                          "patchscopes", "selfie", "probe"])
   p.add_argument("--layers", default="all", help="'all' or comma-separated layer indices")
   p.add_argument("--latentlens_bank", default="./results/latentlens_index/bank")
+  p.add_argument("--tuned_lens", default="./results/tuned_lens/llava15_tuned_lens.pt",
+                 help="translators from train_tuned_lens.py")
   p.add_argument("--ps_prompt", default="identity", choices=["identity", "entity"])
   p.add_argument("--ps_synonyms", action="store_true",
                  help="also score synonyms in Patchscopes (about 2x slower)")
@@ -136,9 +150,30 @@ def run_readouts(args, mt, states, meta, class_names, layers):
       save_scores(os.path.join(score_dir, f"{name}.npz"), layers, per_layer(ro.scores))
       del ro
 
-  if "patchscopes" in args.readouts and not done("patchscopes_raw", "patchscopes_pmi"):
-    print(f"Readout: patchscopes ({args.ps_prompt} prompt)")
-    ro = Patchscopes(mt, class_names, syn if args.ps_synonyms else plain, args.ps_prompt,
+  if "tuned_lens" in args.readouts and not done("tuned_lens"):
+    if not os.path.exists(args.tuned_lens):
+      raise FileNotFoundError(f"{args.tuned_lens} not found: run train_tuned_lens.py first")
+    print(f"Readout: tuned_lens ({args.tuned_lens})")
+    ro = TunedLens(mt, class_names, plain, args.device, args.tuned_lens)
+    save_scores(os.path.join(score_dir, "tuned_lens.npz"), layers, per_layer(ro.scores))
+    del ro
+
+  if "embedding_lens" in args.readouts and not done("embedding_lens"):
+    print("Readout: embedding_lens")
+    ro = EmbeddingLens(mt, class_names, plain, args.device)
+    save_scores(os.path.join(score_dir, "embedding_lens.npz"), layers, per_layer(ro.scores))
+
+  # Injection readouts: Patchscopes (identity / entity prompt) and the SelfIE-style prompt.
+  injections = []
+  if "patchscopes" in args.readouts:
+    injections.append(("patchscopes", args.ps_prompt))
+  if "selfie" in args.readouts:
+    injections.append(("selfie", "selfie"))
+  for prefix, prompt in injections:
+    if done(f"{prefix}_raw", f"{prefix}_pmi"):
+      continue
+    print(f"Readout: {prefix} ({prompt} prompt)")
+    ro = Patchscopes(mt, class_names, syn if args.ps_synonyms else plain, prompt,
                      args.device, rows_per_batch=args.ps_rows_per_batch)
     rows = np.arange(len(meta))
     if args.ps_max_images:
@@ -151,8 +186,8 @@ def run_readouts(args, mt, states, meta, class_names, layers):
       r, p = ro.scores(states[rows, l].float(), l)
       raw[i, rows], pmi[i, rows] = r, p
       print(f"    layer {l}: {len(rows)} rows ({time.time() - t0:.1f}s)")
-    save_scores(os.path.join(score_dir, "patchscopes_raw.npz"), layers, raw)
-    save_scores(os.path.join(score_dir, "patchscopes_pmi.npz"), layers, pmi)
+    save_scores(os.path.join(score_dir, f"{prefix}_raw.npz"), layers, raw)
+    save_scores(os.path.join(score_dir, f"{prefix}_pmi.npz"), layers, pmi)
 
   if "probe" in args.readouts:
     for kind in ("linear", "mlp"):

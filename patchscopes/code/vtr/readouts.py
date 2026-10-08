@@ -6,11 +6,15 @@ ranked against the same 80 COCO class names. A class is represented by its name 
 or "bag" cannot tell classes apart and are dropped).
 
   LogitLens     final norm + lm_head; class score = best log-prob of a first sub-token of a form
+  TunedLens     LogitLens after a learned per-layer affine translator (Belrose et al., 2023);
+                translators are trained on text by train_tuned_lens.py
+  EmbeddingLens max cosine to the input embedding of a first sub-token of a form
   LatentLens    max cosine to bank entries whose word (in its sentence) names the class
   Patchscopes   inject the state into a text prompt; class score = log-likelihood of the
                 continuation naming the class. Reported raw and prior-corrected (PMI: minus the
                 same log-likelihood with no injection), because the prompt itself favours some
-                words ("cat" appears in the identity prompt).
+                words ("cat" appears in the identity prompt). The same class runs the
+                SelfIE-style prompt (`selfie`), which injects at five placeholder positions.
   probe_scores  supervised linear / MLP probe, images grouped across folds (availability)
 """
 
@@ -25,8 +29,18 @@ from analyze_object_identification import SURFACE_FORMS
 from latentlens_object_identification import word_context, word_matches
 from visual_object_identification import TARGET_PROMPTS, class_token_ids, get_decoder
 
-# How a class name continues each Patchscopes target prompt.
-CONTINUATIONS = {"identity": " -> {}", "entity": ": {}"}
+# Injection prompts: (prompt text, how a class name continues it, placeholder token).
+# placeholder None = inject at the last prompt token (Patchscopes' '?' / 'x'); otherwise inject at
+# every occurrence of that token.
+#  identity / entity: unmodified target prompts of the original Patchscopes notebooks.
+#  selfie: SelfIE-style interpretation prompt (Chen et al., ICML 2024), in LLaVA's USER/ASSISTANT
+#          format, with the state repeated over five placeholders. Unlike the original SelfIE we
+#          inject at the source layer (same-layer patching) and score a closed set of class names.
+PROMPTS = {
+    "identity": (TARGET_PROMPTS["identity"], " -> {}", None),
+    "entity": (TARGET_PROMPTS["entity"], ": {}", None),
+    "selfie": ("USER: _ _ _ _ _\nASSISTANT: Sure, I'll summarize your message:", " {}", "▁_"),
+}
 
 
 def class_forms(class_names, synonyms):
@@ -67,6 +81,63 @@ class LogitLens:
       x = h[start:start + self.chunk].to(self.device, dtype)
       logp = self.head(self.norm(x)).float().log_softmax(-1)
       out.append(_scatter_max(logp[:, self.ids], self.cls, self.n_classes).cpu())
+    return torch.cat(out).numpy()
+
+
+def rms_norm(x, weight, eps):
+  """LLaMA RMSNorm in float32 (same as the decoder's final norm)."""
+  x = x.float()
+  return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+
+class TunedLens(LogitLens):
+  """LogitLens on h + A_l h + b_l, with translators (A, b) trained by train_tuned_lens.py."""
+
+  name = "tuned_lens"
+
+  def __init__(self, mt, class_names, forms, device, translators_path, chunk=512):
+    super().__init__(mt, class_names, forms, device, chunk)
+    saved = torch.load(translators_path, map_location="cpu", weights_only=False)
+    self.A = saved["A"].to(device, torch.float32)   # [L, d, d]
+    self.b = saved["b"].to(device, torch.float32)   # [L, d]
+    self.norm_w = self.norm.weight.detach().to(device, torch.float32)
+    self.eps = self.norm.variance_epsilon
+    self.head_w = self.head.weight.detach().to(device, torch.float32)
+
+  @torch.no_grad()
+  def scores(self, h, layer):
+    out = []
+    for start in range(0, h.shape[0], self.chunk):
+      x = h[start:start + self.chunk].to(self.device, torch.float32)
+      x = x + x @ self.A[layer].T + self.b[layer]
+      logp = (rms_norm(x, self.norm_w, self.eps) @ self.head_w.T).log_softmax(-1)
+      out.append(_scatter_max(logp[:, self.ids], self.cls, self.n_classes).cpu())
+    return torch.cat(out).numpy()
+
+
+class EmbeddingLens:
+  """Nearest input embedding: max cosine between the state and a class's first sub-tokens.
+
+  The EmbeddingLens baseline of LatentLens (Krojer et al., 2026), scored closed-set.
+  """
+
+  name = "embedding_lens"
+
+  def __init__(self, mt, class_names, forms, device, chunk=2048):
+    pairs = sorted({(ci, tid) for ci, c in enumerate(class_names)
+                    for f in forms[c] for tid in class_token_ids(mt.tokenizer, f)})
+    self.n_classes, self.device, self.chunk = len(class_names), device, chunk
+    self.cls = torch.tensor([p[0] for p in pairs], device=device)
+    emb = mt.model.get_input_embeddings().weight.detach()
+    ids = torch.tensor([p[1] for p in pairs], device=emb.device)
+    self.emb = F.normalize(emb[ids].float(), dim=-1).to(device)
+
+  @torch.no_grad()
+  def scores(self, h, layer=None):
+    out = []
+    for start in range(0, h.shape[0], self.chunk):
+      q = F.normalize(h[start:start + self.chunk].float(), dim=-1).to(self.device)
+      out.append(_scatter_max(q @ self.emb.T, self.cls, self.n_classes).cpu())
     return torch.cat(out).numpy()
 
 
@@ -150,13 +221,19 @@ class Patchscopes:
     self.mt, self.device = mt, device
     self.decoder = get_decoder(mt)
     tok = mt.tokenizer
-    prompt = TARGET_PROMPTS[prompt_key]
+    prompt, continuation, placeholder = PROMPTS[prompt_key]
     self.prompt_ids = tok(prompt)["input_ids"]
-    self.pos = len(self.prompt_ids) - 1  # the placeholder token ('?' or 'x')
+    if placeholder is None:
+      self.pos = [len(self.prompt_ids) - 1]  # the last prompt token ('?' or 'x')
+    else:
+      pid = tok.convert_tokens_to_ids(placeholder)
+      self.pos = [i for i, t in enumerate(self.prompt_ids) if t == pid]
+      if not self.pos:
+        raise ValueError(f"placeholder {placeholder!r} not found in the {prompt_key} prompt")
     conts, owners = [], []
     for ci, c in enumerate(class_names):
       for f in forms[c]:
-        full = tok(prompt + CONTINUATIONS[prompt_key].format(f))["input_ids"]
+        full = tok(prompt + continuation.format(f))["input_ids"]
         if full[:len(self.prompt_ids)] != self.prompt_ids:
           raise ValueError(f"prompt tokenization changes when followed by {f!r}")
         conts.append(full[len(self.prompt_ids):])
@@ -180,8 +257,8 @@ class Patchscopes:
 
     def hook(module, inp, out):
       hs = out[0] if isinstance(out, tuple) else out
-      if hs.shape[1] > self.pos:
-        hs[:, self.pos] = states.to(hs.dtype)
+      if hs.shape[1] > max(self.pos):  # the prompt pass, not continuation-only passes
+        hs[:, self.pos] = states.to(hs.dtype)[:, None, :]
     return self.decoder.layers[layer].register_forward_hook(hook)
 
   @torch.no_grad()
