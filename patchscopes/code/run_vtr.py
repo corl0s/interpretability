@@ -5,6 +5,8 @@ Stages (each checkpointed in --out_dir; re-runs skip finished stages unless --ov
   cache     hidden states of sampled tokens + pooled + random, all layers -> states.pt
   readouts  scores over the 80 COCO classes for each readout and layer  -> scores/*.npz
   eval      accuracies per layer / condition, image-clustered CIs, plots -> summary.csv ...
+            plus the same on the "fair" class subset (every training-free readout can
+            score and tell the classes apart)                        -> *_fair.*, fair_classes.json
 
 Readout names in the outputs:
   logit_lens, logit_lens_syn         class name only / with unambiguous synonyms
@@ -40,6 +42,9 @@ from vtr.readouts import (LatentLens, LogitLens, Patchscopes, class_forms,  # no
                           probe_scores)
 
 MAIN_READOUTS = ["logit_lens", "latentlens", "patchscopes_pmi", "probe_linear"]
+# Readouts whose class coverage defines the fair subset (the probe is a supervised reference).
+# patchscopes_pmi is the main Patchscopes number, fixed before looking at results.
+TRAINING_FREE = ["logit_lens", "latentlens", "patchscopes_pmi"]
 
 
 def parse_args(argv=None):
@@ -216,13 +221,32 @@ def main(argv=None):
       if fname.endswith(".npz") and not fname.endswith("_entries.npz"):
         ls, s = load_scores(os.path.join(score_dir, fname))
         scores[fname[:-4]] = (ls, s)
-    print(f"Evaluating {sorted(scores)} ...")
+    print(f"Evaluating {sorted(scores)} on all {len(class_names)} classes ...")
     summary = E.evaluate(scores, meta, class_names, args.n_boot, args.seed)
     summary.to_csv(os.path.join(args.out_dir, "summary.csv"), index=False)
-    head = E.headline(summary)
+    head = E.headline(summary, len(class_names))
     head.to_csv(os.path.join(args.out_dir, "headline.csv"), index=False)
     print(head.to_string(index=False))
-    E.plot(summary, args.out_dir, [r for r in MAIN_READOUTS if r in scores])
+    main_present = [r for r in MAIN_READOUTS if r in scores]
+    E.plot(summary, args.out_dir, main_present)
+
+    # Fair comparison: only classes every training-free readout can score and tell apart,
+    # ranked among those classes only (the probe is evaluated on the same subset).
+    keep, dropped = E.fair_classes(scores, [r for r in TRAINING_FREE if r in scores],
+                                   class_names)
+    with open(os.path.join(args.out_dir, "fair_classes.json"), "w", encoding="utf-8") as f:
+      json.dump({"kept": [class_names[i] for i in keep], "dropped": dropped}, f, indent=2)
+    print(f"\nFair subset: {len(keep)} of {len(class_names)} classes "
+          f"(dropped: {', '.join(sorted(dropped)) or 'none'})")
+    if len(keep) >= 2:
+      sub_scores, sub_meta, sub_names = E.subset(scores, meta, class_names, keep)
+      fair = E.evaluate(sub_scores, sub_meta, sub_names, args.n_boot, args.seed)
+      fair.to_csv(os.path.join(args.out_dir, "summary_fair.csv"), index=False)
+      head_fair = E.headline(fair, len(sub_names))
+      head_fair.to_csv(os.path.join(args.out_dir, "headline_fair.csv"), index=False)
+      print(f"{sub_meta['image_id'].nunique()} images, {len(sub_meta)} rows")
+      print(head_fair.to_string(index=False))
+      E.plot(fair, args.out_dir, main_present, prefix="fair_")
     print(f"All outputs in {args.out_dir}")
 
 

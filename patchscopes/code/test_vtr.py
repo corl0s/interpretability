@@ -51,6 +51,37 @@ def test_forms_and_ranks():
   print("forms + ranks OK")
 
 
+def test_fair_subset():
+  names = ["dog", "cat", "baseball bat", "baseball glove", "toaster"]
+  rng = np.random.RandomState(0)
+  lens = rng.randn(2, 6, 5).astype(np.float32)
+  lens[..., 3] = lens[..., 2]                    # logit lens cannot tell bat from glove
+  latent = rng.randn(2, 6, 5).astype(np.float32)
+  latent[..., 4] = -np.inf                       # LatentLens cannot score toaster
+  ps = rng.randn(2, 6, 5).astype(np.float32)
+  ps[:, 3:] = np.nan                             # Patchscopes ran on a subset of rows
+  scores = {"logit_lens": ([0, 2], lens), "latentlens": ([0, 2], latent),
+            "patchscopes_pmi": ([0, 2], ps)}
+  keep, dropped = E.fair_classes(scores, ["logit_lens", "latentlens", "patchscopes_pmi"], names)
+  assert keep == [0, 1], (keep, dropped)
+  assert set(dropped) == {"baseball bat", "baseball glove", "toaster"}
+  assert "tied" in dropped["baseball bat"] and "never scored" in dropped["toaster"]
+
+  meta = pd.DataFrame({"class_name": ["dog", "cat", "toaster", "dog", "cat", "baseball bat"],
+                       "image_id": [1, 2, 3, 4, 5, 6]})
+  sub, sub_meta, sub_names = E.subset(scores, meta, names, keep)
+  assert sub_names == ["dog", "cat"] and list(sub_meta["image_id"]) == [1, 2, 4, 5]
+  assert sub["latentlens"][1].shape == (2, 4, 2)
+
+  summary = pd.DataFrame({
+      "readout": "r", "metric": "top1", "condition": "object_high",
+      "layer": [0, 2, 4, 6], "mean": [0.05, 0.1, 0.3, 0.4], "ci_lo": [0.01, 0.05, 0.2, 0.3],
+      "ci_hi": [0.1, 0.15, 0.4, 0.5]})
+  head = E.headline(summary, n_candidates=2).iloc[0]
+  assert head["best_layer"] == 6 and head["half_peak_layer"] == 4 and head["chance"] == 0.5
+  print("fair subset + headline OK")
+
+
 def test_sampling():
   cov = np.zeros(576)
   cov[:3], cov[3:6], cov[6:9], cov[9:20] = 0.1, 0.4, 0.6, 1.0
@@ -106,6 +137,7 @@ def test_latentlens(mt, class_names, tmp):
 
 def main():
   test_forms_and_ranks()
+  test_fair_subset()
   test_sampling()
 
   with tempfile.TemporaryDirectory() as tmp:
@@ -170,6 +202,19 @@ def main():
     for f in ("accuracy_by_layer.png", "accuracy_by_overlap.png", "pooling.png"):
       assert os.path.exists(os.path.join(out_dir, f)), f
     print("readouts + evaluation + plots OK")
+
+    # run_vtr's eval stage end to end, including the fair-subset outputs.
+    import json
+    with open(os.path.join(out_dir, "samples.json"), "w", encoding="utf-8") as f:
+      json.dump({"class_names": class_names, "geometry": "llava-1.5", "samples": samples}, f)
+    torch.save({"states": states, "meta": meta}, os.path.join(out_dir, "states.pt"))
+    run_vtr.main(["--out_dir", out_dir, "--stage", "eval", "--n_boot", "50"])
+    for f in ("summary.csv", "headline.csv", "fair_classes.json"):
+      assert os.path.exists(os.path.join(out_dir, f)), f
+    with open(os.path.join(out_dir, "fair_classes.json"), encoding="utf-8") as f:
+      fair = json.load(f)
+    assert len(fair["kept"]) + len(fair["dropped"]) == len(class_names)
+    print(f"eval stage OK (fair subset keeps {fair['kept']})")
 
   print("\nALL TESTS PASSED")
 

@@ -28,6 +28,8 @@ Script: `run_vtr.py` · Package: `vtr/` · Test: `test_vtr.py`
    - conditions: `object_high` (≥ 50%), each overlap bin, pooled mean/max, and the controls `outside`, `random` and `shuffled` (another image's label)
    - outputs: `summary.csv` (everything), `headline.csv` (best layer, layer 2, onset layer = first layer above all controls), and three plots
 
+The eval stage also writes a **fair** version, `headline_fair.csv`, `summary_fair.csv` and `fair_*.png`. It is restricted to classes that every training-free readout (logit lens, LatentLens, Patchscopes PMI) can score and tell apart, ranked among those classes only. `fair_classes.json` lists the dropped classes with the reason for each. Use the fair version for comparisons between tools.
+
 Ranking is pessimistic: ties with the true class count against the readout, and a class a readout cannot score at all is ranked last.
 
 ## Run on SCC

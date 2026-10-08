@@ -85,11 +85,13 @@ def evaluate(scores_by_readout, meta, class_names, n_boot, seed):
   return pd.concat(frames, ignore_index=True)
 
 
-def headline(summary):
-  """Per readout: best layer, accuracy there and at layer 2, and the onset layer.
+def headline(summary, n_candidates=None):
+  """Per readout: best layer, accuracy there and at layer 2, and two onset layers.
 
-  Onset = first layer whose CI lower bound exceeds the highest control mean
-  (outside / random / shuffled) of that readout at that layer.
+  onset_layer     = first layer whose CI lower bound exceeds the highest control mean
+                    (outside / random / shuffled) of that readout at that layer.
+  half_peak_layer = first layer reaching half of that readout's own peak accuracy; this
+                    separates readouts that are all "above controls" from layer 0.
   """
   rows = []
   top1 = summary[summary.metric == "top1"]
@@ -99,6 +101,7 @@ def headline(summary):
             .groupby("layer")["mean"].max())
     above = obj.index[obj["ci_lo"] > ctrl.reindex(obj.index).fillna(0)]
     best = int(obj["mean"].idxmax())
+    half = obj.index[obj["mean"] >= 0.5 * obj.loc[best, "mean"]]
     pooled = g[g.condition == "pooled_mean"].set_index("layer")["mean"]
     rows.append({
         "readout": name,
@@ -106,17 +109,58 @@ def headline(summary):
         "acc_best": round(float(obj.loc[best, "mean"]), 4),
         "acc_layer2": round(float(obj.loc[2, "mean"]), 4) if 2 in obj.index else None,
         "onset_layer": int(above.min()) if len(above) else None,
+        "half_peak_layer": int(half.min()) if len(half) else None,
         "pooled_mean_best": round(float(pooled.max()), 4) if len(pooled) else None,
         "max_control": round(float(ctrl.max()), 4) if len(ctrl) else None,
+        "chance": round(1.0 / n_candidates, 4) if n_candidates else None,
     })
   return pd.DataFrame(rows)
+
+
+def fair_classes(scores_by_readout, readouts, class_names):
+  """Classes that every listed readout can score and can tell apart from all other classes.
+
+  A class is excluded if, for some readout,
+    * it is never given a finite score (e.g. no LatentLens bank entry names it), or
+    * its score column is identical to another class's column on every row and layer
+      (e.g. the logit lens ties classes that share a first sub-token).
+  Returns (kept class indices, {class: reason}).
+  """
+  dropped = {}
+  for name in readouts:
+    if name not in scores_by_readout:
+      continue
+    _, s = scores_by_readout[name]
+    columns = np.moveaxis(s, -1, 0).reshape(s.shape[-1], -1)       # [C, L * n]
+    finite = np.isfinite(columns)
+    seen = {}
+    for c, col in enumerate(columns):
+      if not finite[c].any():
+        dropped.setdefault(class_names[c], f"{name}: never scored")
+        continue
+      seen.setdefault(np.nan_to_num(col, nan=-9e9).tobytes(), []).append(c)
+    for group in seen.values():
+      if len(group) > 1:
+        others = ", ".join(class_names[o] for o in group)
+        for c in group:
+          dropped.setdefault(class_names[c], f"{name}: tied with {others}")
+  keep = [i for i, c in enumerate(class_names) if c not in dropped]
+  return keep, dropped
+
+
+def subset(scores_by_readout, meta, class_names, keep):
+  """Restrict rows to images of kept classes and candidates to the kept classes."""
+  kept = [class_names[i] for i in keep]
+  rows = meta["class_name"].isin(kept).to_numpy()
+  sub = {n: (ls, s[:, rows][:, :, keep]) for n, (ls, s) in scores_by_readout.items()}
+  return sub, meta[rows].reset_index(drop=True), kept
 
 
 # Validated categorical slots (CVD-safe in this order).
 PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 
 
-def plot(summary, out_dir, main_readouts):
+def plot(summary, out_dir, main_readouts, prefix=""):
   import os
 
   import matplotlib
@@ -144,12 +188,12 @@ def plot(summary, out_dir, main_readouts):
           .groupby("layer")["mean"].max())
   ax.plot(ctrl.index, ctrl.values, ":", color="#9a9994", lw=1.5, label="max control")
   ax.set_xlabel("LLM layer (output of block l)")
-  ax.set_ylabel("top-1 accuracy (80 classes)")
+  ax.set_ylabel("top-1 accuracy")
   ax.set_title("COCO-VTR objects, LLaVA-1.5-7B: readout accuracy by layer", loc="left")
   ax.legend(frameon=False, fontsize=9)
   style(ax)
   fig.tight_layout()
-  fig.savefig(os.path.join(out_dir, "accuracy_by_layer.png"), dpi=150)
+  fig.savefig(os.path.join(out_dir, prefix + "accuracy_by_layer.png"), dpi=150)
   plt.close(fig)
 
   # 2. Accuracy by overlap bin at each readout's best layer.
@@ -173,7 +217,7 @@ def plot(summary, out_dir, main_readouts):
   ax.legend(frameon=False, fontsize=8)
   style(ax)
   fig.tight_layout()
-  fig.savefig(os.path.join(out_dir, "accuracy_by_overlap.png"), dpi=150)
+  fig.savefig(os.path.join(out_dir, prefix + "accuracy_by_overlap.png"), dpi=150)
   plt.close(fig)
 
   # 3. Single token vs pooled, per readout (small multiples).
@@ -194,5 +238,5 @@ def plot(summary, out_dir, main_readouts):
   axes[0].set_ylabel("top-1 accuracy")
   axes[0].legend(frameon=False, fontsize=8)
   fig.tight_layout()
-  fig.savefig(os.path.join(out_dir, "pooling.png"), dpi=150)
+  fig.savefig(os.path.join(out_dir, prefix + "pooling.png"), dpi=150)
   plt.close(fig)
