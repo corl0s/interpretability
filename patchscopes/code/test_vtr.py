@@ -264,6 +264,26 @@ def main():
     assert len(fair["kept"]) + len(fair["dropped"]) == len(class_names)
     print(f"eval stage OK (fair subset keeps {fair['kept']})")
 
+    # Task 5 sweep: cells exist, the diagonal equals ordinary same-layer Patchscopes.
+    import run_ps_sweep as S
+    sweep_dir = os.path.join(out_dir, "sweep")
+    S.main(["--vtr_dir", out_dir, "--out_dir", sweep_dir, "--layers", "1,2",
+            "--n_images", "4", "--rows_per_batch", "16", "--n_boot", "20",
+            "--device", "cpu"], mt=mt)
+    with open(os.path.join(sweep_dir, "config.json"), encoding="utf-8") as f:
+      rows = np.array(json.load(f)["rows"])
+    ps = Patchscopes(mt, class_names, class_forms(class_names, False), "identity", "cpu",
+                     rows_per_batch=16)
+    _, expected = ps.scores(states[rows, 2].float(), 2)
+    got = np.load(os.path.join(sweep_dir, "cells", "s2_t2.npz"))["pmi"].astype(np.float32)
+    assert np.allclose(got, expected, atol=2e-2), np.abs(got - expected).max()
+    off = np.load(os.path.join(sweep_dir, "cells", "s2_t1.npz"))["pmi"].astype(np.float32)
+    assert not np.allclose(off, got, atol=1e-3), "target layer had no effect"
+    for f in ("sweep_summary.csv", "sweep_best_target.csv", "sweep_heatmap.png",
+              "sweep_summary_fair.csv", "sweep_heatmap_fair.png"):
+      assert os.path.exists(os.path.join(sweep_dir, f)), f
+    print("source x target sweep OK (diagonal == same-layer Patchscopes)")
+
   print("\nALL TESTS PASSED")
 
 
