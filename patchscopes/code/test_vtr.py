@@ -84,6 +84,23 @@ def test_fair_subset():
   print("fair subset + headline OK")
 
 
+def test_complementarity():
+  import run_failure_map as M
+  correct = np.array([[1, 0, 0],    # only tool a
+                      [1, 1, 0],    # shared
+                      [0, 0, 1],    # only tool c
+                      [0, 0, 0]], dtype=bool)  # none
+  tools = ["logit_lens", "latentlens", "selfie_pmi"]
+  cols = M.complementarity(correct, tools)
+  assert cols["only_logit_lens"].tolist() == [1, 0, 0, 0]
+  assert cols["only_selfie_pmi"].tolist() == [0, 0, 1, 0]
+  assert cols["shared"].tolist() == [0, 1, 0, 0] and cols["none"].tolist() == [0, 0, 0, 1]
+  assert cols["union"].mean() == 0.75
+  shares = M.pattern_shares(correct, tools)
+  assert shares["LogitLens+LatentLens"] == 0.25 and shares["none"] == 0.25
+  print("complementarity OK")
+
+
 def test_sampling():
   cov = np.zeros(576)
   cov[:3], cov[3:6], cov[6:9], cov[9:20] = 0.1, 0.4, 0.6, 1.0
@@ -181,6 +198,7 @@ def test_latentlens(mt, class_names, tmp):
 def main():
   test_forms_and_ranks()
   test_fair_subset()
+  test_complementarity()
   test_sampling()
 
   with tempfile.TemporaryDirectory() as tmp:
@@ -283,6 +301,20 @@ def main():
               "sweep_summary_fair.csv", "sweep_heatmap_fair.png"):
       assert os.path.exists(os.path.join(sweep_dir, f)), f
     print("source x target sweep OK (diagonal == same-layer Patchscopes)")
+
+    # Task 2 failure map, end to end (Patchscopes was scored on 2 of 4 images only).
+    import run_failure_map as M
+    M.main(["--vtr_dir", out_dir, "--n_boot", "20", "--extended"])
+    fm = pd.read_csv(os.path.join(out_dir, "failure_map_extended", "failure_summary.csv"))
+    one = fm[(fm.condition == "object_high") & (fm.metric == "top1")].pivot_table(
+        index="layer", columns="quantity", values="mean")
+    only = one[[c for c in one.columns if c.startswith("only_")]].sum(1)
+    assert np.allclose(one["union"], only + one["shared"]), "union != exclusive + shared"
+    assert np.allclose(one["union"] + one["none"], 1.0)
+    assert (one["gain"] >= -1e-9).all() and np.allclose(one["gain"],
+                                                         one["union"] - one["best_single"])
+    assert os.path.exists(os.path.join(out_dir, "failure_map_extended", "failure_map.png"))
+    print("failure map OK")
 
   print("\nALL TESTS PASSED")
 
