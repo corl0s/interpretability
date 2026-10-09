@@ -39,9 +39,20 @@ from vtr.geometry import BINS, HIGH_COVERAGE  # noqa: E402
 
 MAIN_TOOLS = ["logit_lens", "latentlens", "patchscopes_pmi", "selfie_pmi"]
 EXTRA_TOOLS = ["tuned_lens", "embedding_lens"]
-SHORT = {"logit_lens": "LogitLens", "latentlens": "LatentLens", "patchscopes_pmi": "Patchscopes",
-         "selfie_pmi": "SelfIE", "tuned_lens": "TunedLens", "embedding_lens": "EmbeddingLens",
-         "probe_linear": "Probe"}
+class _Short(dict):
+  """Display names; unknown score names (e.g. patchscopes_t0_pmi) fall back to readable text."""
+
+  def __missing__(self, key):
+    base, _, rest = key.partition("_t")
+    if rest and rest.split("_")[0].isdigit() and base in ("patchscopes", "selfie"):
+      return f"{self[base + '_pmi']}@L{rest.split('_')[0]}"
+    return key
+
+
+SHORT = _Short({"logit_lens": "LogitLens", "latentlens": "LatentLens",
+                "patchscopes_pmi": "Patchscopes", "selfie_pmi": "SelfIE",
+                "tuned_lens": "TunedLens", "embedding_lens": "EmbeddingLens",
+                "probe_linear": "Probe"})
 
 
 def complementarity(correct, tools):
@@ -192,6 +203,9 @@ def parse_args(argv=None):
   p.add_argument("--vtr_dir", default="./results/vtr_llava15")
   p.add_argument("--out_dir", default=None, help="default: <vtr_dir>/failure_map")
   p.add_argument("--extended", action="store_true", help="add tuned lens and embedding lens")
+  p.add_argument("--tools", nargs="+", default=None,
+                 help="score names to use instead of the default set, e.g. logit_lens "
+                      "latentlens patchscopes_t0_pmi selfie_t0_pmi")
   p.add_argument("--all_classes", action="store_true", help="use all classes, not the fair subset")
   p.add_argument("--n_boot", type=int, default=1000)
   p.add_argument("--seed", type=int, default=0)
@@ -206,7 +220,7 @@ def main(argv=None):
   with open(os.path.join(args.vtr_dir, "samples.json"), encoding="utf-8") as f:
     class_names = json.load(f)["class_names"]
   meta = load_meta(args.vtr_dir)
-  wanted = MAIN_TOOLS + (EXTRA_TOOLS if args.extended else [])
+  wanted = args.tools or (MAIN_TOOLS + (EXTRA_TOOLS if args.extended else []))
   scores = load_scores(args.vtr_dir, wanted + ["probe_linear"])
   tools = [t for t in wanted if t in scores]
   missing = [t for t in wanted if t not in scores]

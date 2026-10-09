@@ -361,6 +361,24 @@ def main():
       assert os.path.exists(os.path.join(out_dir, "unified", f)), f
     print("unified decoder end to end OK")
 
+    # Fixed target-layer injection (--ps_target_layer): new score names, injected at layer 1.
+    args_t = run_vtr.parse_args(["--out_dir", out_dir, "--device", "cpu", "--readouts",
+                                 "patchscopes", "selfie", "--ps_target_layer", "1",
+                                 "--ps_rows_per_batch", "16", "--ps_max_images", "2"])
+    run_vtr.run_readouts(args_t, mt, states, meta, class_names, [0, 2, 3])
+    ls, s_t = run_vtr.load_scores(os.path.join(out_dir, "scores", "patchscopes_t1_pmi.npz"))
+    assert ls == [0, 2, 3]
+    rows_t = np.flatnonzero(~np.isnan(s_t[0]).all(1))
+    _, want = ps.scores(states[rows_t, 3].float(), 1)
+    assert np.allclose(s_t[2][rows_t], want, atol=2e-2), "not injected at the target layer"
+    assert os.path.exists(os.path.join(out_dir, "scores", "selfie_t1_pmi.npz"))
+    U.main(["--vtr_dir", out_dir, "--n_boot", "20", "--dev_fraction", "0.5",
+            "--out_dir", os.path.join(out_dir, "unified_t1"),
+            "--tools", "logit_lens", "latentlens", "patchscopes_t1_pmi", "selfie_t1_pmi"])
+    M.main(["--vtr_dir", out_dir, "--n_boot", "20", "--out_dir",
+            os.path.join(out_dir, "failure_t1"), "--tools", "logit_lens", "selfie_t1_pmi"])
+    print("target-layer injection + --tools OK")
+
   print("\nALL TESTS PASSED")
 
 

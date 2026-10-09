@@ -16,6 +16,8 @@ Readout names in the outputs:
   latentlens, latentlens_syn         same two variants (needs a LatentLens bank for LLaVA)
   patchscopes_raw, patchscopes_pmi   continuation log-likelihood; PMI subtracts the prompt prior
   selfie_raw, selfie_pmi             the same with the SelfIE-style prompt (5 placeholders)
+  *_t<L>_raw, *_t<L>_pmi             Patchscopes / SelfIE injected at fixed target layer L
+                                     (--ps_target_layer L) instead of the source layer
   probe_linear, probe_mlp            supervised references (availability)
 
   --readouts picks which to compute: logit_lens tuned_lens embedding_lens latentlens
@@ -88,6 +90,9 @@ def parse_args(argv=None):
                  help="also score synonyms in Patchscopes (about 2x slower)")
   p.add_argument("--ps_max_images", type=int, default=0, help="0 = all images")
   p.add_argument("--ps_rows_per_batch", type=int, default=256)
+  p.add_argument("--ps_target_layer", type=int, default=None,
+                 help="inject Patchscopes / SelfIE states at this target layer instead of the "
+                      "source layer (outputs are named e.g. patchscopes_t0_pmi)")
   p.add_argument("--probe_splits", type=int, default=5)
   # eval
   p.add_argument("--n_boot", type=int, default=2000)
@@ -170,6 +175,8 @@ def run_readouts(args, mt, states, meta, class_names, layers):
   if "selfie" in args.readouts:
     injections.append(("selfie", "selfie"))
   for prefix, prompt in injections:
+    if args.ps_target_layer is not None:
+      prefix = f"{prefix}_t{args.ps_target_layer}"
     if done(f"{prefix}_raw", f"{prefix}_pmi"):
       continue
     print(f"Readout: {prefix} ({prompt} prompt)")
@@ -183,7 +190,8 @@ def run_readouts(args, mt, states, meta, class_names, layers):
     pmi = raw.copy()
     for i, l in enumerate(layers):
       t0 = time.time()
-      r, p = ro.scores(states[rows, l].float(), l)
+      target = l if args.ps_target_layer is None else args.ps_target_layer
+      r, p = ro.scores(states[rows, l].float(), target)
       raw[i, rows], pmi[i, rows] = r, p
       print(f"    layer {l}: {len(rows)} rows ({time.time() - t0:.1f}s)")
     save_scores(os.path.join(score_dir, f"{prefix}_raw.npz"), layers, raw)

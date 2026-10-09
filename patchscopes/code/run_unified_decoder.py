@@ -223,6 +223,9 @@ def parse_args(argv=None):
   p.add_argument("--vtr_dir", default="./results/vtr_llava15")
   p.add_argument("--out_dir", default=None, help="default: <vtr_dir>/unified[_extended]")
   p.add_argument("--extended", action="store_true", help="add tuned lens and embedding lens")
+  p.add_argument("--tools", nargs="+", default=None,
+                 help="score names to use instead of the default set, e.g. logit_lens "
+                      "latentlens patchscopes_t0_pmi selfie_t0_pmi")
   p.add_argument("--all_classes", action="store_true")
   p.add_argument("--dev_fraction", type=float, default=0.3)
   p.add_argument("--n_boot", type=int, default=1000)
@@ -238,7 +241,7 @@ def main(argv=None):
   with open(os.path.join(args.vtr_dir, "samples.json"), encoding="utf-8") as f:
     class_names = json.load(f)["class_names"]
   meta = load_meta(args.vtr_dir)
-  wanted = MAIN_TOOLS + (EXTRA_TOOLS if args.extended else [])
+  wanted = args.tools or (MAIN_TOOLS + (EXTRA_TOOLS if args.extended else []))
   scores = load_scores(args.vtr_dir, wanted)
   tools = [t for t in wanted if t in scores]
   if not args.all_classes:
@@ -265,7 +268,7 @@ def main(argv=None):
   order = tools + ["best_single_test", "routing", "fusion_equal", "fusion_weighted",
                    "rank_fusion", "union"]
   print("\nTest images, object tokens, top-1:")
-  print(table[order].rename(columns=lambda c: SHORT.get(c, c)).to_string())
+  print(table[order].rename(columns=lambda c: SHORT[c]).to_string())
   h = head[(head.condition == "object_high") & (head.metric == "top1")].set_index("method")
   print("\nAggregate (mean over layers), object tokens, top-1:")
   print(h.loc[order, ["mean_acc_over_layers", "mean_gain_vs_best_single",
