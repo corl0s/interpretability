@@ -137,6 +137,17 @@ def test_unified_decoder():
         f"union bound {h.loc['union', 'mean_acc_over_layers']:.2f})")
 
 
+def test_background_distance():
+  import run_background_distance as B
+  cov = np.zeros(576)
+  cov[24 * 10 + 10] = 1.0                       # object covers token (10, 10)
+  assert B.grid_distance(cov, 24 * 10 + 11) == 1
+  assert B.grid_distance(cov, 24 * 12 + 10) == 2
+  assert B.grid_distance(cov, 24 * 0 + 0) == 10
+  assert [B.distance_bin(d) for d in (1, 2, 3, 4, 10)] == ["adjacent", "near", "near", "far", "far"]
+  print("background distance OK")
+
+
 def test_sampling():
   cov = np.zeros(576)
   cov[:3], cov[3:6], cov[6:9], cov[9:20] = 0.1, 0.4, 0.6, 1.0
@@ -236,6 +247,7 @@ def main():
   test_fair_subset()
   test_complementarity()
   test_unified_decoder()
+  test_background_distance()
   test_sampling()
 
   with tempfile.TemporaryDirectory() as tmp:
@@ -378,6 +390,19 @@ def main():
     M.main(["--vtr_dir", out_dir, "--n_boot", "20", "--out_dir",
             os.path.join(out_dir, "failure_t1"), "--tools", "logit_lens", "selfie_t1_pmi"])
     print("target-layer injection + --tools OK")
+
+    # Decoder checks (held-out classes, label-free) and background-by-distance, end to end.
+    import run_background_distance as B
+    import run_decoder_checks as D
+    D.main(["--vtr_dir", out_dir, "--repeats", "2", "--dev_fraction", "0.5"])
+    held = pd.read_csv(os.path.join(out_dir, "decoder_checks", "heldout_classes.csv"))
+    assert "fusion_weighted_unseen_classes" in held and (held["probe_trained_on_other_classes"] == 0).all()
+    lf = pd.read_csv(os.path.join(out_dir, "decoder_checks", "label_free.csv"))
+    assert "zscore_equal_label_free" in lf
+    B.main(["--vtr_dir", out_dir, "--n_boot", "20"])
+    bd = pd.read_csv(os.path.join(out_dir, "background_distance", "background_by_distance.csv"))
+    assert set(bd["distance"]) <= {"adjacent", "near", "far"} and len(bd)
+    print("decoder checks + background distance OK")
 
   print("\nALL TESTS PASSED")
 
