@@ -101,6 +101,42 @@ def test_complementarity():
   print("complementarity OK")
 
 
+def test_unified_decoder():
+  """Two tools that are each right on a different half of the images: fusion must beat both."""
+  import run_unified_decoder as U
+  rng = np.random.RandomState(0)
+  n_img, per_img, C = 200, 3, 10
+  image_id = np.repeat(np.arange(n_img), per_img)
+  labels = rng.randint(0, C, n_img)[image_id]
+  names = [f"c{i}" for i in range(C)]
+  meta = pd.DataFrame({"image_id": image_id, "class_name": [names[l] for l in labels],
+                       "kind": "object", "coverage": 1.0})
+  group = (image_id % 2 == 0)
+  a = rng.randn(len(meta), C)
+  b = rng.randn(len(meta), C) * 3 + 5          # different scale: calibration must handle it
+  a[group, labels[group]] += 4.0               # tool a sure and right on even images
+  b[~group, labels[~group]] += 12.0            # tool b sure and right on odd images
+  scores = {"logit_lens": ([0], a[None].astype(np.float32)),
+            "latentlens": ([0], b[None].astype(np.float32))}
+  ranks, _, dev, scored, layers, params = U.decode(scores, meta, names,
+                                                   ["logit_lens", "latentlens"], 0.3, 0)
+  test = ~dev
+  acc = {m: float((r[test] == 1).mean()) for m, r in ranks[0].items()}
+  single = max(acc["logit_lens"], acc["latentlens"])
+  assert acc["fusion_weighted"] > single + 0.2, acc
+  assert acc["fusion_equal"] > single + 0.2, acc
+  # Rank fusion ignores confidence, so it need not beat a single tool here; sanity only.
+  assert 0.3 < acc["rank_fusion"] <= 1.0, acc
+  assert acc["routing"] == acc[params.loc[0, "route"]]
+  assert 0.25 < dev.mean() < 0.35 and not (set(image_id[dev]) & set(image_id[test]))
+  summary = U.summarize(ranks, meta, dev, scored, layers, ["logit_lens", "latentlens"], 50, 0)
+  head = U.headline(summary, ["logit_lens", "latentlens"])
+  h = head[(head.condition == "object_high") & (head.metric == "top1")].set_index("method")
+  assert h.loc["fusion_weighted", "mean_gain_vs_best_single"] > 0.2
+  print(f"unified decoder OK (single {single:.2f} -> fusion {acc['fusion_weighted']:.2f}, "
+        f"union bound {h.loc['union', 'mean_acc_over_layers']:.2f})")
+
+
 def test_sampling():
   cov = np.zeros(576)
   cov[:3], cov[3:6], cov[6:9], cov[9:20] = 0.1, 0.4, 0.6, 1.0
@@ -199,6 +235,7 @@ def main():
   test_forms_and_ranks()
   test_fair_subset()
   test_complementarity()
+  test_unified_decoder()
   test_sampling()
 
   with tempfile.TemporaryDirectory() as tmp:
@@ -315,6 +352,14 @@ def main():
                                                          one["union"] - one["best_single"])
     assert os.path.exists(os.path.join(out_dir, "failure_map_extended", "failure_map.png"))
     print("failure map OK")
+
+    # Task 4 unified decoder, end to end.
+    import run_unified_decoder as U
+    U.main(["--vtr_dir", out_dir, "--n_boot", "20", "--dev_fraction", "0.5"])
+    for f in ("unified_summary.csv", "unified_headline.csv", "unified_weights.csv",
+              "unified_by_layer.png"):
+      assert os.path.exists(os.path.join(out_dir, "unified", f)), f
+    print("unified decoder end to end OK")
 
   print("\nALL TESTS PASSED")
 
