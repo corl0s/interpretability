@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from analyze_object_identification import SURFACE_FORMS
 from latentlens_object_identification import word_context, word_matches
 from visual_object_identification import TARGET_PROMPTS, class_token_ids, get_decoder
+from vtr.models import text_position_ids
 
 # Injection prompts: (prompt text, how a class name continues it, placeholder token).
 # placeholder None = inject at the last prompt token (Patchscopes' '?' / 'x'); otherwise inject at
@@ -39,7 +40,10 @@ from visual_object_identification import TARGET_PROMPTS, class_token_ids, get_de
 PROMPTS = {
     "identity": (TARGET_PROMPTS["identity"], " -> {}", None),
     "entity": (TARGET_PROMPTS["entity"], ": {}", None),
-    "selfie": ("USER: _ _ _ _ _\nASSISTANT: Sure, I'll summarize your message:", " {}", "▁_"),
+    # Placeholder spellings per tokenizer: SentencePiece (LLaVA) "▁_"; byte-level BPE (Qwen) "Ġ_",
+    # where the last one merges with the newline into "Ġ_Ċ" (still the fifth placeholder).
+    "selfie": ("USER: _ _ _ _ _\nASSISTANT: Sure, I'll summarize your message:", " {}",
+               (("▁_",), ("Ġ_", "Ġ_Ċ"), ("_",))),
 }
 
 
@@ -226,8 +230,16 @@ class Patchscopes:
     if placeholder is None:
       self.pos = [len(self.prompt_ids) - 1]  # the last prompt token ('?' or 'x')
     else:
-      pid = tok.convert_tokens_to_ids(placeholder)
-      self.pos = [i for i, t in enumerate(self.prompt_ids) if t == pid]
+      # The placeholder's spelling differs per tokenizer (SentencePiece "▁_", byte-level BPE
+      # "Ġ_"); use the first candidate that occurs in the tokenized prompt.
+      candidates = placeholder if isinstance(placeholder, tuple) else (placeholder,)
+      self.pos = []
+      for cand in candidates:
+        spellings = cand if isinstance(cand, tuple) else (cand,)
+        ids = {tok.convert_tokens_to_ids(t) for t in spellings} - {None, tok.unk_token_id}
+        self.pos = [i for i, t in enumerate(self.prompt_ids) if t in ids]
+        if self.pos:
+          break
       if not self.pos:
         raise ValueError(f"placeholder {placeholder!r} not found in the {prompt_key} prompt")
     conts, owners = [], []
@@ -274,7 +286,8 @@ class Patchscopes:
       ids = torch.tensor([self.prompt_ids] * n, device=self.device)
       handle = self._hook(layer, states)
       try:
-        out = self.mt.model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=True)
+        out = self.mt.model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=True,
+                            position_ids=text_position_ids(self.mt, 0, P, n, self.device))
       finally:
         if handle is not None:
           handle.remove()
@@ -288,7 +301,10 @@ class Patchscopes:
       m = mask.repeat(n, 1)
       attn = torch.cat([torch.ones((n * S, P), dtype=torch.long, device=self.device), m], 1)
       logits = self.mt.model(input_ids=c, attention_mask=attn, past_key_values=past,
-                             use_cache=False).logits.float().log_softmax(-1)  # [n*S, W, V]
+                             use_cache=False,
+                             position_ids=text_position_ids(self.mt, P, c.shape[1], n * S,
+                                                            self.device)
+                             ).logits.float().log_softmax(-1)  # [n*S, W, V]
       tok_lp = torch.empty(c.shape, device=self.device)
       tok_lp[:, 0] = first.gather(1, c[:, :1]).squeeze(1)
       if c.shape[1] > 1:
@@ -301,7 +317,9 @@ class Patchscopes:
       attn = torch.cat([torch.ones((n * S, P), dtype=torch.long, device=self.device), m], 1)
       handle = self._hook(layer, None if states is None else states.repeat_interleave(S, 0))
       try:
-        logits = self.mt.model(input_ids=seq, attention_mask=attn).logits.float()
+        logits = self.mt.model(input_ids=seq, attention_mask=attn,
+                               position_ids=text_position_ids(self.mt, 0, seq.shape[1], n * S,
+                                                              self.device)).logits.float()
       finally:
         if handle is not None:
           handle.remove()

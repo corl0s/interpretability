@@ -88,3 +88,20 @@ python run_vtr.py --out_dir ./results/vtr_llava15 --stage eval
 2. The `verify` lines printed for the first image (captured states equal HF hidden states).
 3. **Controls:** in `headline.csv`, `max_control` should be near the 1/80 chance level (≈ 1–3%). A high control for a readout means the readout favours some class names regardless of input.
 4. LatentLens prints the classes no bank entry names. Those are always ranked last; the `_syn` variant should reduce that list.
+
+
+## Second model: Qwen2.5-VL-7B (added 2026-10-09)
+
+Same pipeline, with the model inferred from `--model_name`:
+- **Token geometry** (`vtr.geometry.Qwen25Geometry`): the aspect-preserving resize to multiples of 28 px (no crop), each LLM token = one 28×28 cell (2×2 merged 14-px patches), row-major. A 640×480 image gives 17×23 = 391 tokens. `test_qwen.py` checks this against the real Qwen image processor, down to the pixel order.
+- **Capture** (`vtr.models`): uses the Qwen chat prompt, and checks every image's grid against the geometry. Runs in bfloat16.
+- **Patchscopes / SelfIE:** text-only passes get explicit multimodal-RoPE text positions. The SelfIE placeholder is `Ġ_`; Qwen merges the last one with the newline into `Ġ_Ċ`, which still counts as the fifth.
+- **LatentLens:** pre-built bank `McGill-NLP/contextual_embeddings-qwen2.5-vl-7b` (HF layers 1,2,4,8,16,24,26,27; ~30 GB).
+- **28 decoder layers** (LLaVA has 32).
+- `--same_images ./results/vtr_llava15/samples.json` reuses LLaVA's images and objects, so the comparison is on the same data.
+- `--max_pixels` lowers the resolution (fewer, larger tokens), for the within-model resolution manipulation.
+
+```bash
+python test_qwen.py                                   # CPU, ~2 min
+python get_latentlens_bank.py --download McGill-NLP/contextual_embeddings-qwen2.5-vl-7b     --out ./results/latentlens_index_qwen25vl/bank    # ~30 GB
+```

@@ -282,8 +282,11 @@ def word_context(tokenizer, caption, position, token_id, width=2):
   ids = tokenizer(caption, truncation=True, max_length=512)["input_ids"]
   if position >= len(ids) or ids[position] != token_id:
     return None
-  full = tokenizer.decode(ids[1:], skip_special_tokens=True)
-  prefix = tokenizer.decode(ids[1:position + 1], skip_special_tokens=True)
+  # Skip a leading BOS token if the tokenizer adds one (LLaVA/Llama does, Qwen does not).
+  first = 1 if tokenizer.bos_token_id is not None and ids and ids[0] == tokenizer.bos_token_id \
+      else 0
+  full = tokenizer.decode(ids[first:], skip_special_tokens=True)
+  prefix = tokenizer.decode(ids[first:position + 1], skip_special_tokens=True)
   if not full.startswith(prefix):
     return None
   rest = full[len(prefix):]

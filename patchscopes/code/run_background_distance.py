@@ -32,13 +32,14 @@ TOOLS = ["logit_lens", "latentlens", "patchscopes_pmi", "selfie_pmi", "tuned_len
 BINS = (("adjacent", 1, 1), ("near", 2, 3), ("far", 4, 99))
 
 
-def grid_distance(coverage, token, grid=24):
-  """Chebyshev distance from `token` to the nearest token with coverage > 0."""
-  cov = np.asarray(coverage).reshape(grid, grid)
+def grid_distance(coverage, token, grid=(24, 24)):
+  """Chebyshev distance from `token` to the nearest token with coverage > 0 (row-major grid)."""
+  n_rows, n_cols = (grid, grid) if isinstance(grid, int) else grid
+  cov = np.asarray(coverage).reshape(n_rows, n_cols)
   rows, cols = np.nonzero(cov > 0)
   if not len(rows):
     return np.nan
-  r, c = divmod(int(token), grid)
+  r, c = divmod(int(token), n_cols)
   return int(np.max(np.abs(np.stack([rows - r, cols - c])), axis=0).min())
 
 
@@ -68,6 +69,7 @@ def main(argv=None):
     data = json.load(f)
   class_names = data["class_names"]
   coverage = {s["image_id"]: s["coverage"] for s in data["samples"]}
+  grids = {s["image_id"]: tuple(s.get("grid", (24, 24))) for s in data["samples"]}
   meta = load_meta(args.vtr_dir)
   scores = load_scores(args.vtr_dir, TOOLS)
   if not args.all_classes:
@@ -79,7 +81,8 @@ def main(argv=None):
   outside = (meta["kind"] == "outside").to_numpy()
   dist = np.full(len(meta), np.nan)
   for i in np.flatnonzero(outside):
-    dist[i] = grid_distance(coverage[meta["image_id"].iat[i]], meta["token"].iat[i])
+    image_id = meta["image_id"].iat[i]
+    dist[i] = grid_distance(coverage[image_id], meta["token"].iat[i], grids[image_id])
   bins = np.array([distance_bin(d) if np.isfinite(d) else "" for d in dist])
   counts = pd.Series(bins[outside]).value_counts().to_dict()
   print(f"background tokens by distance: {counts}")

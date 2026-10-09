@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vtr import evaluate as E  # noqa: E402
 from vtr.cache import cache_states  # noqa: E402
-from vtr.data import select_object_samples, summarize_samples  # noqa: E402
+from vtr.data import select_object_samples, select_same_images, summarize_samples  # noqa: E402
 from vtr.geometry import GEOMETRIES  # noqa: E402
 from vtr.readouts import (EmbeddingLens, LatentLens, LogitLens, Patchscopes,  # noqa: E402
                           TunedLens, class_forms, probe_scores)
@@ -66,7 +66,13 @@ def parse_args(argv=None):
   p.add_argument("--coco_dir", default=None)
   p.add_argument("--out_dir", default="./results/vtr_llava15")
   p.add_argument("--model_name", default="llava-hf/llava-1.5-7b-hf")
-  p.add_argument("--geometry", default="llava-1.5", choices=sorted(GEOMETRIES))
+  p.add_argument("--geometry", default=None, choices=sorted(GEOMETRIES),
+                 help="token geometry; default: inferred from --model_name")
+  p.add_argument("--min_pixels", type=int, default=56 * 56, help="Qwen2.5-VL resize lower bound")
+  p.add_argument("--max_pixels", type=int, default=12845056,
+                 help="Qwen2.5-VL resize upper bound (lower it to test fewer, larger tokens)")
+  p.add_argument("--same_images", default=None,
+                 help="samples.json of another run: reuse its images and objects")
   # data
   p.add_argument("--n_images", type=int, default=1000)
   p.add_argument("--per_class", type=int, default=20, help="max images per class")
@@ -105,8 +111,20 @@ def parse_args(argv=None):
 def load_model(args):
   from general_utils import ModelAndTokenizer
   dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
+  if "qwen" in args.model_name.lower():
+    dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
   print(f"Loading {args.model_name} ...")
-  return ModelAndTokenizer(args.model_name, torch_dtype=dtype, device=args.device)
+  mt = ModelAndTokenizer(args.model_name, torch_dtype=dtype, device=args.device)
+  if getattr(mt, "family", "") == "qwen2.5-vl" and mt.processor is not None:
+    mt.processor.set_pixel_bounds(args.min_pixels, args.max_pixels)
+  return mt
+
+
+def make_geometry(args):
+  name = args.geometry or ("qwen2.5-vl" if "qwen" in args.model_name.lower() else "llava-1.5")
+  if name == "qwen2.5-vl":
+    return GEOMETRIES[name](args.min_pixels, args.max_pixels)
+  return GEOMETRIES[name]()
 
 
 def save_scores(path, layers, scores):
@@ -211,7 +229,7 @@ def run_readouts(args, mt, states, meta, class_names, layers):
 def main(argv=None):
   args = parse_args(argv)
   os.makedirs(args.out_dir, exist_ok=True)
-  geometry = GEOMETRIES[args.geometry]()
+  geometry = make_geometry(args)
   stages = ["data", "cache", "readouts", "eval"] if args.stage == "all" else [args.stage]
 
   # ------------------------------------------------------------------ data
@@ -219,9 +237,16 @@ def main(argv=None):
   if "data" in stages and (args.overwrite or not os.path.exists(samples_path)):
     from visual_object_identification import ensure_annotations
     print("Selecting COCO-VTR object samples ...")
-    samples, class_names = select_object_samples(
-        ensure_annotations(args.coco_dir), geometry, args.n_images, args.per_class,
-        args.min_area, args.max_area or None, args.min_tokens, args.seed)
+    if args.same_images:
+      with open(args.same_images, encoding="utf-8") as f:
+        previous = json.load(f)["samples"]
+      samples, class_names = select_same_images(previous, ensure_annotations(args.coco_dir),
+                                                geometry, args.min_tokens)
+      print(f"  reused {len(samples)} of {len(previous)} images from {args.same_images}")
+    else:
+      samples, class_names = select_object_samples(
+          ensure_annotations(args.coco_dir), geometry, args.n_images, args.per_class,
+          args.min_area, args.max_area or None, args.min_tokens, args.seed)
     with open(samples_path, "w", encoding="utf-8") as f:
       json.dump({"class_names": class_names, "geometry": geometry.name, "samples": samples}, f)
     summary = summarize_samples(samples)
@@ -239,7 +264,7 @@ def main(argv=None):
     mt = load_model(args)
     print(f"Caching hidden states for {len(samples)} images ...")
     states, meta = cache_states(mt, mt.processor, samples, args.coco_dir, args.per_bin,
-                                args.n_outside, args.seed)
+                                args.n_outside, args.seed, geometry)
     torch.save({"states": states, "meta": meta}, cache_path)
   if not os.path.exists(cache_path):
     return

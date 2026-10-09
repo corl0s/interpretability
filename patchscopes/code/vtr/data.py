@@ -71,6 +71,7 @@ def select_object_samples(ann_path, geometry, n_images, per_class, min_area, max
         "area": float(ann["area"]),
         "size": size_bucket(ann["area"]),
         "coverage": [round(float(c), 4) for c in cov],
+        "grid": list(geometry.grid(info["height"], info["width"])),
     })
 
   rng = random.Random(seed)
@@ -87,6 +88,29 @@ def select_object_samples(ann_path, geometry, n_images, per_class, min_area, max
       break
     depth += 1
   rng.shuffle(samples)
+  return samples, class_names
+
+
+def select_same_images(previous, ann_path, geometry, min_tokens):
+  """Reuse another run's images and target objects, recomputing coverage for `geometry`.
+
+  Keeps the images whose object still has >= min_tokens tokens at coverage >= 0.5 under the new
+  geometry, so two models are compared on the same images and objects.
+  """
+  coco, _, class_names = load_coco(ann_path)
+  anns = {a["id"]: a for a in coco["annotations"]}
+  imgs = {im["id"]: im for im in coco["images"]}
+  samples = []
+  for prev in previous:
+    ann, info = anns[prev["ann_id"]], imgs[prev["image_id"]]
+    mask = ann_to_mask(ann, info["height"], info["width"])
+    cov = geometry.coverage(mask)
+    if int((cov >= HIGH_COVERAGE).sum()) < min_tokens:
+      continue
+    samples.append({**{k: prev[k] for k in ("image_id", "file_name", "class_name",
+                                             "supercategory", "ann_id", "area", "size")},
+                    "coverage": [round(float(c), 4) for c in cov],
+                    "grid": list(geometry.grid(info["height"], info["width"]))})
   return samples, class_names
 
 

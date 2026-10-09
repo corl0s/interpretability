@@ -175,6 +175,8 @@ def main(argv=None, mt=None):
   if mt is None:
     from general_utils import ModelAndTokenizer
     dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
+    if "qwen" in args.model_name.lower() and args.device.startswith("cuda"):
+      dtype = torch.bfloat16  # Qwen2.5-VL activations can overflow float16
     mt = ModelAndTokenizer(args.model_name, torch_dtype=dtype, device=args.device)
   texts = load_corpus(args.corpus, args.corpus_dir, args.corpus_limit, args.seed)
   print(f"Training tuned lens on {len(texts)} sentences, {args.steps} steps")

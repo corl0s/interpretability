@@ -15,19 +15,24 @@ import pandas as pd
 import torch
 from PIL import Image
 
-from visual_object_identification import capture_visual_states, ensure_image
-from vtr.geometry import HIGH_COVERAGE, sample_tokens
+from visual_object_identification import ensure_image
+from vtr.geometry import GEOMETRIES, HIGH_COVERAGE, sample_tokens
+from vtr.models import capture_states
 
 
-def cache_states(mt, processor, samples, coco_dir, per_bin, n_outside, seed):
+def cache_states(mt, processor, samples, coco_dir, per_bin, n_outside, seed, geometry=None):
   """Returns (states [n_rows, n_layers, hidden] fp16 CPU, meta DataFrame)."""
+  geometry = geometry or GEOMETRIES["llava-1.5"]()
   rng = np.random.RandomState(seed)
   gen = torch.Generator().manual_seed(seed)
   states, meta = [], []
 
   for idx, sample in enumerate(samples):
     image = Image.open(ensure_image(coco_dir, sample["file_name"])).convert("RGB")
-    full = capture_visual_states(mt, processor, image, verify=(idx == 0))  # [L, T, d]
+    full = capture_states(mt, processor, image, geometry, verify=(idx == 0))  # [L, T, d]
+    if full.shape[1] != len(sample["coverage"]):
+      raise ValueError(f"image {sample['image_id']}: {full.shape[1]} visual tokens but "
+                       f"{len(sample['coverage'])} coverage values")
     cov = np.asarray(sample["coverage"])
     base = {k: sample[k] for k in ("image_id", "class_name", "supercategory", "size")}
 
@@ -41,12 +46,12 @@ def cache_states(mt, processor, samples, coco_dir, per_bin, n_outside, seed):
     pooled_mean = obj.mean(dim=1)
     pooled_max = obj.max(dim=1).values
     for kind, vec in (("pooled_mean", pooled_mean), ("pooled_max", pooled_max)):
-      states.append(vec.half())
+      states.append(vec.to(full.dtype))
       meta.append({**base, "kind": kind, "token": -1, "coverage": np.nan, "bin": kind})
 
     noise = torch.randn(pooled_mean.shape, generator=gen)
     noise = noise / noise.norm(dim=-1, keepdim=True) * pooled_mean.norm(dim=-1, keepdim=True)
-    states.append(noise.half())
+    states.append(noise.to(full.dtype))
     meta.append({**base, "kind": "random", "token": -1, "coverage": np.nan, "bin": "random"})
 
     if (idx + 1) % 25 == 0 or idx == 0:

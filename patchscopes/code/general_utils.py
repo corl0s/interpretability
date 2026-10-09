@@ -25,6 +25,55 @@ import torch
 import transformers
 
 
+class QwenVLImageTextProcessor:
+  """Image-only processor for Qwen2.5-VL (no video processor, so no torchvision needed).
+
+  Mirrors what Qwen2_5_VLProcessor does for images: the image processor returns pixel patches
+  and image_grid_thw, and each <|image_pad|> in the text is expanded to one token per merged
+  (merge_size x merge_size) patch cell.
+  """
+
+  # Qwen2.5-VL chat format with its default system prompt, one image then the question.
+  PROMPT = ("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{text}<|im_end|>\n"
+            "<|im_start|>assistant\n")
+
+  def __init__(self, image_processor, tokenizer):
+    self.image_processor = image_processor
+    self.tokenizer = tokenizer
+    self.image_token = "<|image_pad|>"
+    self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
+
+  def set_pixel_bounds(self, min_pixels=None, max_pixels=None):
+    ip = self.image_processor
+    if min_pixels is not None:
+      ip.min_pixels = min_pixels
+      ip.size["shortest_edge"] = min_pixels
+    if max_pixels is not None:
+      ip.max_pixels = max_pixels
+      ip.size["longest_edge"] = max_pixels
+
+  def __call__(self, images=None, text=None, return_tensors="pt"):
+    out = {}
+    texts = [text] if isinstance(text, str) else list(text)
+    if images is not None:
+      images = images if isinstance(images, (list, tuple)) else [images]
+      vis = self.image_processor(images=images, return_tensors=return_tensors)
+      out["pixel_values"], out["image_grid_thw"] = vis["pixel_values"], vis["image_grid_thw"]
+      merge = self.image_processor.merge_size ** 2
+      counts = [int(g.prod()) // merge for g in vis["image_grid_thw"]]
+      expanded, k = [], 0
+      for t in texts:
+        while self.image_token in t:
+          t = t.replace(self.image_token, "<|placeholder|>" * counts[k], 1)
+          k += 1
+        expanded.append(t.replace("<|placeholder|>", self.image_token))
+      texts = expanded
+    enc = self.tokenizer(texts, return_tensors=return_tensors, padding=True)
+    out.update(enc)
+    return out
+
+
 class ModelAndTokenizer:
   """An object to hold a GPT-style language model and tokenizer."""
 
@@ -43,8 +92,44 @@ class ModelAndTokenizer:
     ) or (
         model is not None and "llava" in type(model).__name__.lower()
     )
+    is_qwen_vl = (
+        model_name is not None and "qwen" in model_name.lower() and "vl" in model_name.lower()
+    ) or (
+        model is not None and "qwen2_5_vl" in type(model).__name__.lower()
+    )
 
-    if is_vlm:
+    if is_qwen_vl:
+      from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
+      from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
+          Qwen2VLImageProcessor)
+      if tokenizer is None:
+        assert model_name is not None
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        processor = QwenVLImageTextProcessor(
+            Qwen2VLImageProcessor.from_pretrained(model_name), tokenizer)
+      else:
+        processor = None
+      if model is None:
+        assert model_name is not None
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_name, low_cpu_mem_usage=low_cpu_mem_usage, torch_dtype=torch_dtype)
+        if device is not None:
+          model.to(device)
+        set_requires_grad(False, model)
+        model.eval()
+      self.tokenizer = tokenizer
+      self.model = model
+      self.device = device
+      self.processor = processor
+      self.is_vlm = True
+      self.family = "qwen2.5-vl"
+      self.num_visual_tokens = None  # depends on the image size
+      self.vision_tower = model.model.visual
+      self.layer_names = [
+          n for n, _ in model.named_modules()
+          if re.match(r"^model\.language_model\.layers\.\d+$", n)
+      ]
+    elif is_vlm:
       from transformers import LlavaForConditionalGeneration, LlavaProcessor
       if tokenizer is None:
         assert model_name is not None
@@ -67,6 +152,7 @@ class ModelAndTokenizer:
       self.device = device
       self.processor = processor
       self.is_vlm = True
+      self.family = "llava"
       self.num_visual_tokens = 576
       self.visual_token_start = 1
       # transformers >= 4.5x nests vision_tower / multi_modal_projector /
@@ -102,6 +188,7 @@ class ModelAndTokenizer:
       self.device = device
       self.processor = None
       self.is_vlm = False
+      self.family = "lm"
       self.layer_names = [
           n
           for n, _ in model.named_modules()
