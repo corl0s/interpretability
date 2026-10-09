@@ -23,6 +23,7 @@ import tempfile
 import numpy as np
 import pandas as pd
 import torch
+from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -403,6 +404,40 @@ def main():
     bd = pd.read_csv(os.path.join(out_dir, "background_distance", "background_by_distance.csv"))
     assert set(bd["distance"]) <= {"adjacent", "near", "far"} and len(bd)
     print("decoder checks + background distance OK")
+
+    # Task 6 patch swap: synthetic images with two separated objects of different classes.
+    import run_patch_swap as P
+    swap_coco = os.path.join(tmp, "coco_swap")
+    os.makedirs(os.path.join(swap_coco, "val2017"))
+    os.makedirs(os.path.join(swap_coco, "annotations"))
+    rng_img = np.random.RandomState(1)
+    imgs, anns = [], []
+    for i in range(4):
+      fn = f"{i:012d}.jpg"
+      Image.fromarray(rng_img.randint(0, 255, (480, 640, 3), dtype=np.uint8)).save(
+          os.path.join(swap_coco, "val2017", fn))
+      imgs.append({"id": i, "file_name": fn, "height": 480, "width": 640})
+      for k, (x0, cat) in enumerate(((100, 1 + i % 2), (420, 3))):
+        anns.append({"id": 10 * i + k, "image_id": i, "category_id": cat, "iscrowd": 0,
+                     "area": 25600.0,
+                     "segmentation": [[x0, 160, x0 + 160, 160, x0 + 160, 320, x0, 320]]})
+    with open(os.path.join(swap_coco, "annotations", "instances_val2017.json"), "w",
+              encoding="utf-8") as f:
+      json.dump({"images": imgs, "annotations": anns,
+                 "categories": [{"id": 1, "name": "dog"}, {"id": 2, "name": "cat"},
+                                {"id": 3, "name": "bottle"}]}, f)
+    swap_dir = os.path.join(out_dir, "patch_swap")
+    P.main(["--coco_dir", swap_coco, "--vtr_dir", out_dir, "--out_dir", swap_dir,
+            "--latentlens_bank", bank_dir, "--layers", "1,2", "--n_images", "4",
+            "--per_object", "2", "--rows_per_batch", "16", "--n_boot", "20",
+            "--device", "cpu"], mt=mt)
+    sw = pd.read_csv(os.path.join(swap_dir, "patch_swap_summary.csv"))
+    assert set(sw.readout) == set(P.READOUTS), set(sw.readout)
+    assert sw["mean"].between(0, 1).all()
+    pairs_json = json.load(open(os.path.join(swap_dir, "pairs.json"), encoding="utf-8"))
+    assert len(pairs_json) == 4 and all(
+        p["objects"][0]["class_name"] != p["objects"][1]["class_name"] for p in pairs_json)
+    print("patch swap OK")
 
   print("\nALL TESTS PASSED")
 
