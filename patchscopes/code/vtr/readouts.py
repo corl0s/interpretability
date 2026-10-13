@@ -215,6 +215,23 @@ def _match_bank_entries(meta, tokenizer, class_names, forms):
   return np.asarray(cols, dtype=np.int64), np.asarray(cls, dtype=np.int64)
 
 
+def placeholder_positions(tok, prompt_ids, placeholder, prompt_key=""):
+  """Positions where a state is injected: the last token if `placeholder` is None, else every
+  occurrence of the placeholder token."""
+  if placeholder is None:
+    return [len(prompt_ids) - 1]  # the last prompt token ('?' or 'x')
+  # The placeholder's spelling differs per tokenizer (SentencePiece "▁_", byte-level BPE "Ġ_");
+  # use the first candidate that occurs in the tokenized prompt.
+  candidates = placeholder if isinstance(placeholder, tuple) else (placeholder,)
+  for cand in candidates:
+    spellings = cand if isinstance(cand, tuple) else (cand,)
+    ids = {tok.convert_tokens_to_ids(t) for t in spellings} - {None, tok.unk_token_id}
+    pos = [i for i, t in enumerate(prompt_ids) if t in ids]
+    if pos:
+      return pos
+  raise ValueError(f"placeholder {placeholder!r} not found in the {prompt_key} prompt")
+
+
 class Patchscopes:
   """Closed-set Patchscopes: likelihood of each class-naming continuation after injection."""
 
@@ -227,21 +244,7 @@ class Patchscopes:
     tok = mt.tokenizer
     prompt, continuation, placeholder = PROMPTS[prompt_key]
     self.prompt_ids = tok(prompt)["input_ids"]
-    if placeholder is None:
-      self.pos = [len(self.prompt_ids) - 1]  # the last prompt token ('?' or 'x')
-    else:
-      # The placeholder's spelling differs per tokenizer (SentencePiece "▁_", byte-level BPE
-      # "Ġ_"); use the first candidate that occurs in the tokenized prompt.
-      candidates = placeholder if isinstance(placeholder, tuple) else (placeholder,)
-      self.pos = []
-      for cand in candidates:
-        spellings = cand if isinstance(cand, tuple) else (cand,)
-        ids = {tok.convert_tokens_to_ids(t) for t in spellings} - {None, tok.unk_token_id}
-        self.pos = [i for i, t in enumerate(self.prompt_ids) if t in ids]
-        if self.pos:
-          break
-      if not self.pos:
-        raise ValueError(f"placeholder {placeholder!r} not found in the {prompt_key} prompt")
+    self.pos = placeholder_positions(tok, self.prompt_ids, placeholder, prompt_key)
     conts, owners = [], []
     for ci, c in enumerate(class_names):
       for f in forms[c]:
