@@ -206,14 +206,28 @@ def run_readouts(args, mt, states, meta, class_names, layers):
       rows = np.flatnonzero(meta["image_id"].isin(keep).to_numpy())
     raw = np.full((len(layers), len(meta), len(class_names)), np.nan, dtype=np.float32)
     pmi = raw.copy()
+    # Layer-level checkpoint, so a job stopped by its time limit resumes where it was.
+    partial = os.path.join(score_dir, f"{prefix}_partial.npz")
+    finished = []
+    if os.path.exists(partial):
+      ck = np.load(partial)
+      if list(ck["layers"]) == list(layers):
+        raw, pmi, finished = ck["raw"], ck["pmi"], list(ck["finished"])
+        print(f"    resuming: layers {finished} already done")
     for i, l in enumerate(layers):
+      if l in finished:
+        continue
       t0 = time.time()
       target = l if args.ps_target_layer is None else args.ps_target_layer
       r, p = ro.scores(states[rows, l].float(), target)
       raw[i, rows], pmi[i, rows] = r, p
-      print(f"    layer {l}: {len(rows)} rows ({time.time() - t0:.1f}s)")
+      finished.append(l)
+      np.savez(partial, layers=np.asarray(layers), finished=np.asarray(finished), raw=raw,
+               pmi=pmi)
+      print(f"    layer {l}: {len(rows)} rows ({time.time() - t0:.1f}s)", flush=True)
     save_scores(os.path.join(score_dir, f"{prefix}_raw.npz"), layers, raw)
     save_scores(os.path.join(score_dir, f"{prefix}_pmi.npz"), layers, pmi)
+    os.remove(partial)
 
   if "probe" in args.readouts:
     for kind in ("linear", "mlp"):
