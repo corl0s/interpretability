@@ -27,6 +27,7 @@ Outputs in --out_dir:
 
   python run_injection_proto.py                                   # all variants (~2-3 h)
   python run_injection_proto.py --variants selfie_text img_all     # a subset
+  python run_injection_proto.py --summarize_only                   # tables from finished cells
 """
 
 import argparse
@@ -77,6 +78,8 @@ def parse_args(argv=None):
   p.add_argument("--n_boot", type=int, default=500)
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+  p.add_argument("--summarize_only", action="store_true",
+                 help="no model: summarize the variants whose cells are all finished")
   return p.parse_args(argv)
 
 
@@ -224,15 +227,23 @@ def main(argv=None, mt=None):
   print(f"{meta_rows['image_id'].nunique()} images, {len(rows)} rows "
         f"({meta_rows['kind'].value_counts().to_dict()}); variants {args.variants}; "
         f"sources {sources} x targets {targets}")
-  with open(os.path.join(args.out_dir, "config.json"), "w", encoding="utf-8") as f:
-    json.dump({**vars(args), "rows": rows.tolist()}, f)
-
-  if mt is None:
-    from general_utils import ModelAndTokenizer
-    dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
-    mt = ModelAndTokenizer(args.model_name, torch_dtype=dtype, device=args.device)
-  readouts = run_cells(args, mt, states, meta_rows, rows, coverage, class_names, sources,
-                       targets)
+  if args.summarize_only:
+    args.variants = [v for v in args.variants if all(
+        os.path.exists(os.path.join(args.out_dir, "cells", v, f"s{s}_t{t}.npz"))
+        for s in sources for t in targets)]
+    print(f"summarizing finished variants only: {args.variants}")
+    if not args.variants:
+      return
+    readouts = {}
+  else:
+    with open(os.path.join(args.out_dir, "config.json"), "w", encoding="utf-8") as f:
+      json.dump({**vars(args), "rows": rows.tolist()}, f)
+    if mt is None:
+      from general_utils import ModelAndTokenizer
+      dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
+      mt = ModelAndTokenizer(args.model_name, torch_dtype=dtype, device=args.device)
+    readouts = run_cells(args, mt, states, meta_rows, rows, coverage, class_names, sources,
+                         targets)
 
   fair_path = os.path.join(args.vtr_dir, "fair_classes.json")
   if os.path.exists(fair_path):

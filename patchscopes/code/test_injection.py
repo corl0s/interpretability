@@ -110,6 +110,14 @@ def main():
       assert os.path.exists(os.path.join(out_dir, f)), f
     n_cells = sum(len(fs) for _, _, fs in os.walk(os.path.join(out_dir, "cells")))
     assert n_cells == len(run_injection_proto.VARIANTS) * 4, n_cells
+    os.remove(os.path.join(out_dir, "cells", "img_own", "s2_t1.npz"))
+    os.remove(os.path.join(out_dir, "proto_best.csv"))
+    run_injection_proto.main(["--vtr_dir", vtr_dir, "--out_dir", out_dir, "--sources", "0,2",
+                              "--targets", "0,1", "--n_images", "4", "--n_boot", "20",
+                              "--dev_fraction", "0.5", "--summarize_only"])
+    import pandas as pd
+    done = set(pd.read_csv(os.path.join(out_dir, "proto_best.csv"))["variant"])
+    assert "img_own" not in done and "img_all" in done, done
     print("run_injection_proto OK")
   print("\nALL INJECTION TESTS PASSED")
 
