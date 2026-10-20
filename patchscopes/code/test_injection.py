@@ -109,7 +109,8 @@ def main():
     for f in ("proto_summary.csv", "proto_best.csv", "proto_by_source.png"):
       assert os.path.exists(os.path.join(out_dir, f)), f
     n_cells = sum(len(fs) for _, _, fs in os.walk(os.path.join(out_dir, "cells")))
-    assert n_cells == len(run_injection_proto.VARIANTS) * 4, n_cells
+    plain = [v for v, cfg in run_injection_proto.VARIANTS.items() if not cfg.get("rewind")]
+    assert n_cells == len(plain) * 4, n_cells  # no maps.pt: rewind variants are skipped
     os.remove(os.path.join(out_dir, "cells", "img_own", "s2_t1.npz"))
     os.remove(os.path.join(out_dir, "proto_best.csv"))
     run_injection_proto.main(["--vtr_dir", vtr_dir, "--out_dir", out_dir, "--sources", "0,2",

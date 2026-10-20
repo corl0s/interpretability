@@ -14,6 +14,9 @@ Variants (see vtr/injection.py):
   img_own3x3           state at the 3x3 block around it
   img_footprint        state at every token the object covers
   img_footprint_norm     + norm matching
+  img_all_rewind       img_all, but the layer-s state is first translated to layer t's format by
+                       a label-free rewind map (fit_rewind_maps.py, vtr/rewind.py)
+  selfie_text_rewind   selfie_text with the same rewind map (does the stage matter in text slots?)
 
 Selection is honest: images are split into development (30%) and test (70%); the target layer
 of each (variant, source layer) is chosen on development images and accuracy is reported on test
@@ -28,6 +31,8 @@ Outputs in --out_dir:
   python run_injection_proto.py                                   # all variants (~2-3 h)
   python run_injection_proto.py --variants selfie_text img_all     # a subset
   python run_injection_proto.py --summarize_only                   # tables from finished cells
+
+Rewind variants need <vtr_dir>/rewind/maps.pt (fit_rewind_maps.py); without it they are skipped.
 """
 
 import argparse
@@ -47,6 +52,7 @@ from run_ps_sweep import select_rows  # noqa: E402
 from vtr import evaluate as E  # noqa: E402
 from vtr.injection import IMAGE_QUESTION, InjectionReadout  # noqa: E402
 from vtr.readouts import class_forms  # noqa: E402
+from vtr.rewind import RewindMaps  # noqa: E402
 
 VARIANTS = {
     "selfie_text": dict(target="text", slots="placeholders"),
@@ -58,6 +64,8 @@ VARIANTS = {
     "img_own3x3": dict(target="image", slots="own3x3"),
     "img_footprint": dict(target="image", slots="footprint"),
     "img_footprint_norm": dict(target="image", slots="footprint", norm_match=True),
+    "img_all_rewind": dict(target="image", slots="all", rewind=True),
+    "selfie_text_rewind": dict(target="text", slots="placeholders", rewind=True),
 }
 CONDITIONS = ("object", "pooled_mean", "random")
 
@@ -78,12 +86,14 @@ def parse_args(argv=None):
   p.add_argument("--n_boot", type=int, default=500)
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+  p.add_argument("--rewind_maps", default=None, help="default: <vtr_dir>/rewind/maps.pt")
   p.add_argument("--summarize_only", action="store_true",
                  help="no model: summarize the variants whose cells are all finished")
   return p.parse_args(argv)
 
 
-def run_cells(args, mt, states, meta_rows, rows, coverage, class_names, sources, targets):
+def run_cells(args, mt, states, meta_rows, rows, coverage, class_names, sources, targets,
+              maps=None):
   forms = class_forms(class_names, synonyms=False)
   readouts = {}
   for name in args.variants:
@@ -103,7 +113,12 @@ def run_cells(args, mt, states, meta_rows, rows, coverage, class_names, sources,
         if os.path.exists(path):
           continue
         t0 = time.time()
-        raw, pmi = ro.scores(h, t, positions, v.get("norm_match", False),
+        h_in = h
+        if v.get("rewind"):
+          if not maps.has(s, t):
+            raise KeyError(f"no rewind map for {s} -> {t}; refit with these sources/targets")
+          h_in = maps.apply(h, s, t)
+        raw, pmi = ro.scores(h_in, t, positions, v.get("norm_match", False),
                              v.get("extra_layers", ()))
         np.savez(path, raw=raw.astype(np.float16), pmi=pmi.astype(np.float16))
         print(f"  {name}: source {s:2d} -> target {t:2d} ({time.time() - t0:.1f}s)", flush=True)
@@ -236,6 +251,15 @@ def main(argv=None, mt=None):
       return
     readouts = {}
   else:
+    maps = None
+    if any(VARIANTS[v].get("rewind") for v in args.variants):
+      path = args.rewind_maps or os.path.join(args.vtr_dir, "rewind", "maps.pt")
+      if os.path.exists(path):
+        maps = RewindMaps(path)
+        print(f"rewind maps from {path} ({len(maps.maps)} pairs)")
+      else:
+        args.variants = [v for v in args.variants if not VARIANTS[v].get("rewind")]
+        print(f"no rewind maps at {path}: skipping the rewind variants")
     with open(os.path.join(args.out_dir, "config.json"), "w", encoding="utf-8") as f:
       json.dump({**vars(args), "rows": rows.tolist()}, f)
     if mt is None:
@@ -243,7 +267,7 @@ def main(argv=None, mt=None):
       dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
       mt = ModelAndTokenizer(args.model_name, torch_dtype=dtype, device=args.device)
     readouts = run_cells(args, mt, states, meta_rows, rows, coverage, class_names, sources,
-                         targets)
+                         targets, maps)
 
   fair_path = os.path.join(args.vtr_dir, "fair_classes.json")
   if os.path.exists(fair_path):
