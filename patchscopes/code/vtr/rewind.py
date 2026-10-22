@@ -45,7 +45,7 @@ class PairStats:
 
 def r2(pred, y):
   """Pooled R^2 over all dimensions (1 = perfect, 0 = no better than the mean of y)."""
-  y = y.double()
+  y = y.to(pred.device).double()
   return float(1 - ((y - pred.double()) ** 2).sum() / ((y - y.mean(0)) ** 2).sum())
 
 
