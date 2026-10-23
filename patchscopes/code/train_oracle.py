@@ -22,6 +22,8 @@ Stages (each checkpointed in --out_dir; re-running resumes):
       --vtr_dir ./results/vtr_llava15                                    # all stages
   python train_oracle.py ... --stage eval                                # one stage
   python train_oracle.py ... --label_view crop7      # better labels, in <vtr_dir>/oracle_crop7
+  python train_oracle.py ... --label_view crop7 --inject add \
+      --data_dir <vtr_dir>/oracle_crop7/data --out_dir <vtr_dir>/oracle_crop7_add   # a variant
 """
 
 import argparse
@@ -60,6 +62,9 @@ def parse_args(argv=None):
   p.add_argument("--vtr_dir", default="./results/vtr_llava15")
   p.add_argument("--out_dir", default=None,
                  help="default: <vtr_dir>/oracle_pilot for box3, else <vtr_dir>/oracle_<view>")
+  p.add_argument("--data_dir", default=None,
+                 help="training shards (default <out_dir>/data); point at another run's data to "
+                      "train a variant on the same labels")
   p.add_argument("--model_name", default="llava-hf/llava-1.5-7b-hf")
   # data
   p.add_argument("--n_images", type=int, default=2000)
@@ -71,6 +76,8 @@ def parse_args(argv=None):
   # train
   p.add_argument("--target_layer", type=int, default=4)
   p.add_argument("--no_norm_match", action="store_true")
+  p.add_argument("--inject", default="replace", choices=["replace", "add"],
+                 help="replace the slot states with the state, or add it to them")
   p.add_argument("--n_holdout", type=int, default=10, help="benchmark classes kept out of training")
   p.add_argument("--train_examples", type=int, default=20000)
   p.add_argument("--micro_batch", type=int, default=4)
@@ -127,11 +134,10 @@ def check_label_view(data_dir, view):
     json.dump(view, f)
 
 
-def stage_data(args, mt, out_dir):
+def stage_data(args, mt, out_dir, data_dir):
   layers = [int(x) for x in args.layers.split(",")]
   geometry = run_vtr.make_geometry(SimpleNamespace(geometry=None, model_name=args.model_name))
   images = pick_images(args.coco_dir, args.vtr_dir, args.n_images, args.seed)
-  data_dir = os.path.join(out_dir, "data")
   os.makedirs(data_dir, exist_ok=True)
   check_label_view(data_dir, args.label_view)
   with open(os.path.join(out_dir, "data_images.json"), "w", encoding="utf-8") as f:
@@ -162,8 +168,7 @@ def stage_data(args, mt, out_dir):
           f"({time.time() - t0:.0f}s); e.g. {answers[:6]}", flush=True)
 
 
-def load_data(out_dir):
-  data_dir = os.path.join(out_dir, "data")
+def load_data(data_dir):
   shards = [torch.load(os.path.join(data_dir, f), weights_only=False)
             for f in sorted(os.listdir(data_dir)) if f.endswith(".pt")]
   if not shards:
@@ -213,12 +218,12 @@ def answer_ids(tok, prompt, answer):
   return full[len(base):] + [tok.eos_token_id]
 
 
-def stage_train(args, mt, out_dir, class_names, kept):
+def stage_train(args, mt, out_dir, data_dir, class_names, kept):
   final = os.path.join(out_dir, "lora.pt")
   if os.path.exists(final):
     print(f"  {final} exists: training done")
     return
-  data = load_data(out_dir)
+  data = load_data(data_dir)
   held = holdout_classes(args, kept)
   with open(os.path.join(out_dir, "holdout.json"), "w", encoding="utf-8") as f:
     json.dump(held, f)
@@ -294,7 +299,7 @@ def stage_train(args, mt, out_dir, class_names, kept):
       if not args.no_norm_match:
         h = h / h.norm(dim=-1, keepdim=True).clamp_min(1e-6) * float(ref_norm[args.target_layer])
       # backward() inside the hook's scope: gradient checkpointing re-runs the injection layer
-      with slot_injection(mt, args.target_layer, ro.pos, h):
+      with slot_injection(mt, args.target_layer, ro.pos, h, add=args.inject == "add"):
         out = mt.model(input_ids=input_ids, attention_mask=attn.to(args.device),
                        pixel_values=pixel.expand(B, -1, -1, -1).to(args.device),
                        use_cache=False, logits_to_keep=L + 1)
@@ -332,6 +337,7 @@ def stage_eval(args, mt, out_dir, data, kept):
   blob = torch.load(os.path.join(out_dir, "lora.pt"), weights_only=False)
   cfg = blob["config"]
   t, norm_match = cfg["target_layer"], not cfg["no_norm_match"]
+  add = cfg.get("inject", "replace") == "add"
   if not lora_parameters(mt):
     add_lora(mt, cfg["rank"], cfg["lora_alpha"])
   params = lora_parameters(mt)
@@ -360,7 +366,7 @@ def stage_eval(args, mt, out_dir, data, kept):
     positions = [ro.slots("all")] * len(rows)
     for s in todo:
       t0 = time.time()
-      raw, pmi = ro.scores(states[rows, s].float(), t, positions, norm_match)
+      raw, pmi = ro.scores(states[rows, s].float(), t, positions, norm_match, add=add)
       np.savez(os.path.join(cell_dir, f"s{s}_t{t}.npz"), raw=raw.astype(np.float16),
                pmi=pmi.astype(np.float16))
       print(f"  eval {name}: source {s:2d} -> target {t} ({time.time() - t0:.1f}s)", flush=True)
@@ -466,16 +472,17 @@ def main(argv=None, mt=None):
   default = "oracle_pilot" if args.label_view == "box3" else f"oracle_{args.label_view}"
   out_dir = args.out_dir or os.path.join(args.vtr_dir, default)
   os.makedirs(out_dir, exist_ok=True)
+  data_dir = args.data_dir or os.path.join(out_dir, "data")
   data, kept = load_benchmark(args.vtr_dir)
   stages = ["data", "train", "eval"] if args.stage == "all" else [args.stage]
   if mt is None:
     mt = load_model(args)
   if "data" in stages:
     print("Stage data")
-    stage_data(args, mt, out_dir)
+    stage_data(args, mt, out_dir, data_dir)
   if "train" in stages:
     print("Stage train")
-    stage_train(args, mt, out_dir, data["class_names"], kept)
+    stage_train(args, mt, out_dir, data_dir, data["class_names"], kept)
   if "eval" in stages:
     print("Stage eval")
     stage_eval(args, mt, out_dir, data, kept)

@@ -163,6 +163,21 @@ def main():
     blob = torch.load(os.path.join(crop_dir, "data", "shard_0000.pt"), weights_only=False)
     assert blob["label_view"] == "crop7" and len(blob["answers"]) == 6
     print("label views OK (crop7 data in its own directory, mixing refused)")
+
+    # A variant trained on another run's shards: additive injection at another target layer.
+    add_dir = os.path.join(tmp, "oracle_add")
+    argv = [a if a != out_dir else add_dir for a in common]
+    at0 = list(train)
+    at0[at0.index("--target_layer") + 1] = "0"
+    train_oracle.main(argv + at0 + ["--data_dir", os.path.join(out_dir, "data"), "--inject", "add",
+                                    "--n_boot", "20", "--eval_images", "4"], mt=mt)
+    assert not os.path.exists(os.path.join(add_dir, "data"))
+    cfg = torch.load(os.path.join(add_dir, "lora.pt"), weights_only=False)["config"]
+    assert cfg["inject"] == "add" and cfg["target_layer"] == 0
+    a = np.load(os.path.join(add_dir, "eval", "cells", "untrained", "s2_t0.npz"))["pmi"]
+    r = np.load(os.path.join(ev, "cells", "untrained", "s2_t1.npz"))["pmi"]
+    assert a.shape == r.shape and not np.allclose(a, r)
+    print("variant OK (shared data, additive injection, other target layer)")
   print("\nALL ORACLE TESTS PASSED")
 
 

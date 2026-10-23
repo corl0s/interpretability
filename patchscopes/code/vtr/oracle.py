@@ -55,10 +55,13 @@ class LoRALinear(nn.Module):
 
 
 def add_lora(mt, rank, alpha, targets=LORA_TARGETS):
+  """Fresh adapters (already wrapped layers get new adapters around their frozen base)."""
   for layer in get_decoder(mt).layers:
     attn = layer.self_attn
     for name in targets:
-      setattr(attn, name, LoRALinear(getattr(attn, name), rank, alpha))
+      base = getattr(attn, name)
+      base = base.base if isinstance(base, LoRALinear) else base
+      setattr(attn, name, LoRALinear(base, rank, alpha))
   return lora_parameters(mt)
 
 
@@ -166,14 +169,16 @@ def clean_answer(text, max_words=3):
 
 
 @contextmanager
-def slot_injection(mt, layer, positions, vecs):
-  """Replace the output of decoder block `layer` at `positions` with vecs [B, d] (row-wise)."""
+def slot_injection(mt, layer, positions, vecs, add=False):
+  """Replace (or with add, add to) the output of decoder block `layer` at `positions` with
+  vecs [B, d] (row-wise)."""
   pos = torch.as_tensor(positions, device=vecs.device)
 
   def hook(module, inp, out):
     hs = out[0] if isinstance(out, tuple) else out
     hs = hs.clone()
-    hs[:, pos] = vecs.to(hs.dtype)[:, None, :]
+    v = vecs.to(hs.dtype)[:, None, :]
+    hs[:, pos] = hs[:, pos] + v if add else v
     return (hs,) + tuple(out[1:]) if isinstance(out, tuple) else hs
 
   handle = get_decoder(mt).layers[layer].register_forward_hook(hook)

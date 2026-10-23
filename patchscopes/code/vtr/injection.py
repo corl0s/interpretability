@@ -13,6 +13,7 @@ its scale and persistence:
                     footprint  every token the object covers (coverage >= 0.5)
   norm_match      rescale the state to the median norm of the states it replaces at that layer
   extra_layers    also re-inject at target + each offset (the state is not washed out)
+  add             add the state to the slot states instead of replacing them
 
 Scoring is first-token closed-set: a class scores the best log-probability of the first token of
 " <form>" after the prompt, raw and PMI (minus the same with no injection). That needs one
@@ -121,7 +122,7 @@ class InjectionReadout:
     return torch.tensor([norms[k] for k in range(len(self.layers))])
 
   @torch.no_grad()
-  def _logp(self, states, positions, layer, norm_match=False, extra_layers=()):
+  def _logp(self, states, positions, layer, norm_match=False, extra_layers=(), add=False):
     """First-token log-prob of every class form after injection. -> [n, S]."""
     n = 1 if states is None else states.shape[0]
     handles = []
@@ -138,7 +139,8 @@ class InjectionReadout:
 
         def hook(module, inp, out, vec=vec):
           hs = out[0] if isinstance(out, tuple) else out
-          hs[rows, pos] = vec.to(hs.dtype)[:, None, :].expand(-1, pos.shape[1], -1)
+          v = vec.to(hs.dtype)[:, None, :].expand(-1, pos.shape[1], -1)
+          hs[rows, pos] = hs[rows, pos] + v if add else v
         handles.append(self.layers[l].register_forward_hook(hook))
     try:
       out = self.mt.model(**self._batch_inputs(n), use_cache=False)
@@ -148,12 +150,12 @@ class InjectionReadout:
     lp = out.logits[:, -1].float().log_softmax(-1)
     return lp[:, self.first.to(self.device)].cpu()
 
-  def scores(self, h, layer, positions, norm_match=False, extra_layers=()):
+  def scores(self, h, layer, positions, norm_match=False, extra_layers=(), add=False):
     """h [n, d]; positions: one list of prompt positions per row. Returns (raw, pmi)."""
     raw, pmi = [], []
     for start in range(0, h.shape[0], self.batch):
       s = self._logp(h[start:start + self.batch], positions[start:start + self.batch], layer,
-                     norm_match, extra_layers)
+                     norm_match, extra_layers, add)
       raw.append(_scatter_max(s, self.owner, self.n_classes))
       pmi.append(_scatter_max(s - self.prior, self.owner, self.n_classes))
     return torch.cat(raw).numpy(), torch.cat(pmi).numpy()
