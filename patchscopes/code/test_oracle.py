@@ -99,6 +99,10 @@ def main():
     torch.save({"states": states, "meta": meta}, os.path.join(vtr_dir, "states.pt"))
     with open(os.path.join(vtr_dir, "fair_classes.json"), "w", encoding="utf-8") as f:
       json.dump({"kept": class_names, "dropped": {}}, f)
+    os.makedirs(os.path.join(vtr_dir, "scores"))  # stand-in probe scores for the split tables
+    np.savez(os.path.join(vtr_dir, "scores", "probe_linear.npz"), layers=np.arange(3),
+             scores=np.random.RandomState(0).randn(3, len(meta), len(class_names))
+             .astype(np.float16))
 
     out_dir = os.path.join(tmp, "oracle")
     common = ["--coco_dir", coco_dir, "--vtr_dir", vtr_dir, "--out_dir", out_dir,
@@ -108,7 +112,7 @@ def main():
     with open(os.path.join(out_dir, "data_images.json"), encoding="utf-8") as f:
       used = set(json.load(f))
     assert not used & {s["image_id"] for s in samples}, "oracle data used a benchmark image"
-    shards = sorted(os.listdir(os.path.join(out_dir, "data")))
+    shards = sorted(f for f in os.listdir(os.path.join(out_dir, "data")) if f.endswith(".pt"))
     assert len(shards) == 2, shards
     # Random weights generate noise; give the shards readable answers for the training test.
     words = ["dog", "cat", "tree", "box", "sky", "dogs"]
@@ -142,7 +146,23 @@ def main():
     o = np.load(os.path.join(ev, "cells", "oracle", "s2_t1.npz"))["pmi"]
     assert u.shape == o.shape and not np.allclose(u, o)
     assert os.path.exists(os.path.join(ev, "heldout_split.csv"))
-    print("eval OK (oracle differs from the untrained model; tables written)")
+    hard = pd.read_csv(os.path.join(ev, "hard_split.csv"))
+    assert set(hard["group"]) <= {"easy", "hard"} and "probe" in set(hard["variant"])
+    main_obj = pd.read_csv(os.path.join(ev, "main_object.csv"))
+    assert set(main_obj["main_object"]) <= set(class_names)
+    print("eval OK (oracle differs from the untrained model; seen/held-out and easy/hard tables)")
+
+    try:  # the pilot's box3 shards cannot be mixed with another label view
+      train_oracle.main(common + ["--stage", "data", "--label_view", "crop7"], mt=mt)
+      raise AssertionError("mixed label views were accepted")
+    except ValueError as e:
+      assert "box3" in str(e)
+    crop_dir = os.path.join(tmp, "oracle_crop")
+    argv = [a if a != out_dir else crop_dir for a in common]
+    train_oracle.main(argv + ["--stage", "data", "--label_view", "crop7"], mt=mt)
+    blob = torch.load(os.path.join(crop_dir, "data", "shard_0000.pt"), weights_only=False)
+    assert blob["label_view"] == "crop7" and len(blob["answers"]) == 6
+    print("label views OK (crop7 data in its own directory, mixing refused)")
   print("\nALL ORACLE TESTS PASSED")
 
 

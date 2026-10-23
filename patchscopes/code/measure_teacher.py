@@ -3,7 +3,7 @@ r"""How often is the oracle's teacher right? LLaVA's answer about one token's re
 The visual activation oracle (train_oracle.py) learns to reproduce LLaVA's own answer about the
 region of a visual token, so its accuracy is capped by how often that answer names the token's
 object. This script asks LLaVA about the benchmark object tokens (the train_oracle eval rows) with
-several ways of pointing at the region, and scores each against the COCO class:
+several ways of pointing at the region (vtr.oracle.make_view), and scores each against COCO:
 
   full     the whole image, "What is the main object?"     (no pointing: the main-object baseline)
   boxK     red box around the KxK patch block, "What is the object inside the red box?"
@@ -35,13 +35,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyze_object_identification import bootstrap_by_image  # noqa: E402
 from run_ps_sweep import select_rows  # noqa: E402
 from train_oracle import load_benchmark, load_model  # noqa: E402
-from visual_object_identification import class_token_ids, ensure_image, mentions  # noqa: E402
+from visual_object_identification import ensure_image, mentions  # noqa: E402
 from vtr import evaluate as E  # noqa: E402
-from vtr.injection import IMAGE_QUESTION  # noqa: E402
-from vtr.oracle import BOX_QUESTION, clean_answer, draw_box, square_crop  # noqa: E402
+from vtr.oracle import GREY, ask, block, class_scores, first_tokens, make_view  # noqa: E402,F401
+from vtr.oracle import square_crop  # noqa: E402
 from vtr.readouts import class_forms  # noqa: E402
-
-GREY = (122, 117, 104)  # CLIP pixel mean
 
 
 def parse_args(argv=None):
@@ -58,59 +56,6 @@ def parse_args(argv=None):
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   return p.parse_args(argv)
-
-
-def block(token, k, side=24):
-  """Patch-index bounds [r0, r1) x [c0, c1) of the k x k block centred on token (clipped)."""
-  r, c = divmod(int(token), side)
-  h = k // 2
-  return max(0, r - h), min(side, r + h + 1), max(0, c - h), min(side, c + h + 1)
-
-
-def make_view(image, token, view, side=24):
-  """(PIL image, question) for one view name: full, boxK, cropK, maskK."""
-  if view == "full":
-    return image, IMAGE_QUESTION
-  kind = view.rstrip("0123456789")
-  k = int(view[len(kind):])
-  cell = image.size[0] / side
-  r0, r1, c0, c1 = block(token, k, side)
-  x0, y0, x1, y1 = c0 * cell, r0 * cell, c1 * cell, r1 * cell
-  if kind == "box":
-    return draw_box(image, token, side=side, patches=k), BOX_QUESTION
-  if kind == "crop":
-    crop = image.crop((int(x0), int(y0), int(x1), int(y1)))
-    return crop.resize(image.size, Image.BICUBIC), IMAGE_QUESTION
-  if kind == "mask":
-    out = Image.new("RGB", image.size, GREY)
-    box = (int(x0), int(y0), int(x1), int(y1))
-    out.paste(image.crop(box), box[:2])
-    return out, IMAGE_QUESTION
-  raise ValueError(f"unknown view {view!r}")
-
-
-@torch.no_grad()
-def ask(mt, images, question, max_new_tokens=6):
-  """Greedy answers and the first-step logits [n, vocab]."""
-  tok = mt.tokenizer
-  prompt = f"USER: <image>\n{question} ASSISTANT:"
-  inputs = mt.processor(images=images, text=[prompt] * len(images), return_tensors="pt")
-  inputs = {k: v.to(mt.device) for k, v in inputs.items()}
-  if "pixel_values" in inputs:
-    inputs["pixel_values"] = inputs["pixel_values"].to(mt.model.dtype)
-  pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-  out = mt.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
-                          pad_token_id=pad, output_scores=True, return_dict_in_generate=True)
-  new = out.sequences[:, inputs["input_ids"].shape[1]:]
-  texts = tok.batch_decode(new, skip_special_tokens=True)
-  return [clean_answer(t) for t in texts], out.scores[0].float().log_softmax(-1).cpu()
-
-
-def class_scores(logp, cls, ids, n_classes):
-  """logp [n, V] -> [n, n_classes]: best log-prob of a first sub-token of any form."""
-  out = torch.full((logp.shape[0], n_classes), float("-inf"))
-  return out.scatter_reduce(1, cls.expand(logp.shape[0], -1), logp[:, ids], reduce="amax",
-                            include_self=True).numpy()
 
 
 def main(argv=None, mt=None):
@@ -134,10 +79,7 @@ def main(argv=None, mt=None):
   if mt is None:
     mt = load_model(args)
   forms = class_forms(kept, synonyms=False)
-  pairs = sorted({(ci, t) for ci, c in enumerate(kept) for f in forms[c]
-                  for t in class_token_ids(mt.tokenizer, f)})
-  cls = torch.tensor([p[0] for p in pairs])
-  ids = torch.tensor([p[1] for p in pairs])
+  cls, ids = first_tokens(mt.tokenizer, kept, forms)
   syn = class_forms(kept, synonyms=True)
   lab = rows["class_name"].map({c: i for i, c in enumerate(kept)}).to_numpy()
 

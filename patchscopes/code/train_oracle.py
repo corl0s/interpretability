@@ -2,9 +2,10 @@ r"""Pilot: a self-supervised visual activation oracle for LLaVA-1.5 visual token
 
 Stages (each checkpointed in --out_dir; re-running resumes):
   data   COCO val2017 images NOT in the benchmark (samples.json). For each image: the states of
-         --tokens_per_image random visual tokens at --layers, and LLaVA's own answer to
-         "What is the object inside the red box?" with a red box around the token's 3x3 patch
-         block. The answer is the training target; no annotation is read.   -> data/shard_*.pt
+         --tokens_per_image random visual tokens at --layers, and LLaVA's own answer about the
+         token's region, shown as --label_view (vtr.oracle.make_view): box3 = red box around the
+         3x3 patch block (the pilot), crop7 = only the 7x7 block, enlarged. The answer is the
+         training target; no annotation is read.                          -> data/shard_*.pt
   train  LoRA on the attention projections. Input: the neutral-image prompt of image-slot
          injection, the norm-matched state in all 576 image slots at --target_layer, the
          question "What is the main object in this image? Answer with one word."; loss on the
@@ -13,10 +14,14 @@ Stages (each checkpointed in --out_dir; re-running resumes):
   eval   the run_injection_proto rows (200 benchmark images), same first-token PMI scoring and
          dev/test split, for the oracle and for the same model with LoRA switched off.
                                                                          -> eval/proto_best.csv
+         Also split by seen / held-out class and by easy / hard row: hard = the token's class is
+         not the image's main object (the plain model's whole-image answer), so naming the main
+         object does not score there. The linear probe is scored on the same split.
 
   python train_oracle.py --coco_dir /projectnb/mlresearch/vishnuav/coco \
       --vtr_dir ./results/vtr_llava15                                    # all stages
   python train_oracle.py ... --stage eval                                # one stage
+  python train_oracle.py ... --label_view crop7      # better labels, in <vtr_dir>/oracle_crop7
 """
 
 import argparse
@@ -42,8 +47,8 @@ from visual_object_identification import ensure_image  # noqa: E402
 from vtr import evaluate as E  # noqa: E402
 from vtr.injection import IMAGE_QUESTION, InjectionReadout  # noqa: E402
 from vtr.models import capture_states  # noqa: E402
-from vtr.oracle import (BAD_ANSWERS, BOX_QUESTION, add_lora, clean_answer,  # noqa: E402
-                        draw_box, lora_parameters, set_lora, slot_injection, square_crop)
+from vtr.oracle import (BAD_ANSWERS, add_lora, ask, class_scores, first_tokens,  # noqa: E402
+                        lora_parameters, make_view, set_lora, slot_injection, square_crop)
 from vtr.readouts import class_forms  # noqa: E402
 
 
@@ -53,13 +58,14 @@ def parse_args(argv=None):
   p.add_argument("--stage", default="all", choices=["all", "data", "train", "eval"])
   p.add_argument("--coco_dir", required=True)
   p.add_argument("--vtr_dir", default="./results/vtr_llava15")
-  p.add_argument("--out_dir", default=None, help="default: <vtr_dir>/oracle_pilot")
+  p.add_argument("--out_dir", default=None,
+                 help="default: <vtr_dir>/oracle_pilot for box3, else <vtr_dir>/oracle_<view>")
   p.add_argument("--model_name", default="llava-hf/llava-1.5-7b-hf")
   # data
   p.add_argument("--n_images", type=int, default=2000)
   p.add_argument("--tokens_per_image", type=int, default=8)
   p.add_argument("--layers", default="0,4,8,12,16,20,24,28", help="source layers stored")
-  p.add_argument("--box_patches", type=int, default=3)
+  p.add_argument("--label_view", default="box3", help="boxK | cropK | maskK (vtr.oracle.make_view)")
   p.add_argument("--shard_size", type=int, default=100)
   p.add_argument("--gen_batch", type=int, default=16)
   # train
@@ -105,17 +111,20 @@ def load_benchmark(vtr_dir):
 # ---------------------------------------------------------------------------------- data
 
 
-@torch.no_grad()
-def generate_answers(mt, images, question, max_new_tokens=6):
-  tok = mt.tokenizer
-  prompt = f"USER: <image>\n{question} ASSISTANT:"
-  inputs = mt.processor(images=images, text=[prompt] * len(images), return_tensors="pt")
-  inputs = {k: v.to(mt.device) for k, v in inputs.items()}
-  pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-  out = mt.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
-                          pad_token_id=pad)
-  new = out[:, inputs["input_ids"].shape[1]:]
-  return [clean_answer(t) for t in tok.batch_decode(new, skip_special_tokens=True)]
+def check_label_view(data_dir, view):
+  """All shards of one directory share a label view (pilot shards predate the file: box3)."""
+  path = os.path.join(data_dir, "label_view.json")
+  if os.path.exists(path):
+    with open(path, encoding="utf-8") as f:
+      have = json.load(f)
+  elif any(f.endswith(".pt") for f in os.listdir(data_dir)):
+    have = "box3"
+  else:
+    have = view
+  if have != view:
+    raise ValueError(f"{data_dir} holds {have} labels, not {view}: use another --out_dir")
+  with open(path, "w", encoding="utf-8") as f:
+    json.dump(view, f)
 
 
 def stage_data(args, mt, out_dir):
@@ -124,6 +133,7 @@ def stage_data(args, mt, out_dir):
   images = pick_images(args.coco_dir, args.vtr_dir, args.n_images, args.seed)
   data_dir = os.path.join(out_dir, "data")
   os.makedirs(data_dir, exist_ok=True)
+  check_label_view(data_dir, args.label_view)
   with open(os.path.join(out_dir, "data_images.json"), "w", encoding="utf-8") as f:
     json.dump([im["id"] for im in images], f)
   t0 = time.time()
@@ -132,19 +142,21 @@ def stage_data(args, mt, out_dir):
     if os.path.exists(path):
       continue
     rng = np.random.RandomState(args.seed * 100003 + k)
-    states, answers, image_ids, tokens, boxed = [], [], [], [], []
+    states, answers, image_ids, tokens, views = [], [], [], [], []
     for i, im in enumerate(images[k:k + args.shard_size]):
       image = square_crop(Image.open(ensure_image(args.coco_dir, im["file_name"])).convert("RGB"))
       full = capture_states(mt, mt.processor, image, geometry, verify=(k == 0 and i == 0))
       toks = rng.choice(full.shape[1], args.tokens_per_image, replace=False)
       states.append(full[layers][:, toks].transpose(0, 1).contiguous())  # [n, n_layers, d]
-      boxed += [draw_box(image, t, patches=args.box_patches) for t in toks]
+      views += [make_view(image, t, args.label_view) for t in toks]
       image_ids += [im["id"]] * len(toks)
       tokens += [int(t) for t in toks]
-    for b in range(0, len(boxed), args.gen_batch):
-      answers += generate_answers(mt, boxed[b:b + args.gen_batch], BOX_QUESTION)
+    for b in range(0, len(views), args.gen_batch):
+      chunk = views[b:b + args.gen_batch]
+      answers += ask(mt, [v[0] for v in chunk], chunk[0][1])[0]
     torch.save({"states": torch.cat(states), "answers": answers, "image_id": image_ids,
-                "token": tokens, "layers": layers}, path + ".tmp")
+                "token": tokens, "layers": layers, "label_view": args.label_view},
+               path + ".tmp")
     os.replace(path + ".tmp", path)
     print(f"  data: images {k + len(images[k:k + args.shard_size])}/{len(images)} "
           f"({time.time() - t0:.0f}s); e.g. {answers[:6]}", flush=True)
@@ -372,13 +384,37 @@ def stage_eval(args, mt, out_dir, data, kept):
   o = best[best.variant == "oracle"].set_index("source")
   print((o["test_ci_lo"].round(3).astype(str) + "-" + o["test_ci_hi"].round(3).astype(str))
         .to_frame("ci").T.to_string())
-  held_out_table(args, meta_rows, class_names, sources, t, keep, list(variants), eval_dir,
-                 os.path.join(out_dir, "holdout.json"))
+  set_lora(mt, False)  # the main object is the plain model's whole-image answer
+  main = main_objects(args, mt, data, meta_rows["image_id"].unique(), kept, eval_dir)
+  set_lora(mt, True)
+  split_tables(args, rows, meta_rows, class_names, sources, t, keep, list(variants), eval_dir,
+               os.path.join(out_dir, "holdout.json"), main)
 
 
-def held_out_table(args, meta_rows, class_names, sources, t, keep, variants, eval_dir,
-                   holdout_path):
-  """Top-1 on object rows of test images, split by whether the class was held out of training."""
+def main_objects(args, mt, data, image_ids, kept, eval_dir, batch=16):
+  """{image_id: fair class LLaVA names as the main object of the whole image} (closed top-1)."""
+  path = os.path.join(eval_dir, "main_object.csv")
+  if os.path.exists(path):
+    df = pd.read_csv(path, keep_default_na=False)
+  else:
+    files = {s["image_id"]: s["file_name"] for s in data["samples"]}
+    cls, ids = first_tokens(mt.tokenizer, kept, class_forms(kept, synonyms=False))
+    ids_list, preds, answers = list(image_ids), [], []
+    for b in range(0, len(ids_list), batch):
+      views = [make_view(square_crop(Image.open(ensure_image(args.coco_dir, files[i]))
+                                     .convert("RGB")), 0, "full") for i in ids_list[b:b + batch]]
+      a, logp = ask(mt, [v[0] for v in views], views[0][1])
+      answers += a
+      preds += [kept[k] for k in class_scores(logp, cls, ids, len(kept)).argmax(1)]
+    df = pd.DataFrame({"image_id": ids_list, "main_object": preds, "answer": answers})
+    df.to_csv(path, index=False)
+  return dict(zip(df["image_id"], df["main_object"]))
+
+
+def split_tables(args, rows, meta_rows, class_names, sources, t, keep, variants, eval_dir,
+                 holdout_path, main):
+  """Top-1 on object rows of test images, split by seen / held-out class (was the class kept out
+  of training?) and by easy / hard row (hard: the class is not the image's main object)."""
   with open(holdout_path, encoding="utf-8") as f:
     held = set(json.load(f))
   index = {c: i for i, c in enumerate(class_names)}
@@ -391,26 +427,44 @@ def held_out_table(args, meta_rows, class_names, sources, t, keep, variants, eva
   dev = set(images[:int(round(0.3 * len(images)))])
   test_obj = (~m["image_id"].isin(dev) & (m["kind"] == "object")).to_numpy()
   is_held = m["class_name"].isin(held).to_numpy()
-  out = []
+  is_hard = (m["class_name"] != m["image_id"].map(main)).to_numpy()
+
+  top1 = {}
   for v in variants:
     for s in sources:
       cell = np.load(os.path.join(eval_dir, "cells", v, f"s{s}_t{t}.npz"))["pmi"]
-      top1 = E.ranks(cell.astype(np.float32)[ok][:, keep], lab) == 1
-      for group, mask in (("seen", test_obj & ~is_held), ("held-out", test_obj & is_held)):
-        out.append({"variant": v, "group": group, "source": s, "top1": top1[mask].mean() if mask.any() else np.nan,
-                    "n": int(mask.sum())})
-  df = pd.DataFrame(out)
-  df.to_csv(os.path.join(eval_dir, "heldout_split.csv"), index=False)
-  table = df.pivot_table(index=["variant", "group"], columns="source", values="top1")
-  table["mean"] = table.mean(axis=1)
-  n = df.groupby("group")["n"].first().to_dict()
-  print(f"\nSeen vs held-out classes (test object rows: {n}; held-out: {sorted(held)}):")
-  print(table.round(3).to_string())
+      top1[(v, s)] = E.ranks(cell.astype(np.float32)[ok][:, keep], lab) == 1
+  probe_path = os.path.join(args.vtr_dir, "scores", "probe_linear.npz")
+  if os.path.exists(probe_path):
+    layers, scores = run_vtr.load_scores(probe_path)
+    for s in sources:
+      if s in layers:
+        top1[("probe", s)] = E.ranks(scores[layers.index(s)][rows][ok][:, keep], lab) == 1
+
+  splits = {"heldout_split": [("seen", ~is_held), ("held-out", is_held)],
+            "hard_split": [("easy", ~is_hard), ("hard", is_hard)]}
+  for name, groups in splits.items():
+    out = [{"variant": v, "group": g, "source": s, "n": int((test_obj & mask).sum()),
+            "top1": hit[test_obj & mask].mean() if (test_obj & mask).any() else np.nan}
+           for (v, s), hit in top1.items() for g, mask in groups
+           if name == "hard_split" or v != "probe"]
+    df = pd.DataFrame(out)
+    df.to_csv(os.path.join(eval_dir, f"{name}.csv"), index=False)
+    table = df.pivot_table(index=["variant", "group"], columns="source", values="top1")
+    table["mean"] = table.mean(axis=1)
+    n = df.groupby("group")["n"].first().to_dict()
+    if name == "heldout_split":
+      print(f"\nSeen vs held-out classes (test object rows: {n}; held-out: {sorted(held)}):")
+    else:
+      print(f"\nEasy vs hard rows (test object rows: {n}; hard = the class is not the main "
+            f"object LLaVA names for the whole image, so naming the main object scores 0):")
+    print(table.round(3).to_string())
 
 
 def main(argv=None, mt=None):
   args = parse_args(argv)
-  out_dir = args.out_dir or os.path.join(args.vtr_dir, "oracle_pilot")
+  default = "oracle_pilot" if args.label_view == "box3" else f"oracle_{args.label_view}"
+  out_dir = args.out_dir or os.path.join(args.vtr_dir, default)
   os.makedirs(out_dir, exist_ok=True)
   data, kept = load_benchmark(args.vtr_dir)
   stages = ["data", "train", "eval"] if args.stage == "all" else [args.stage]
