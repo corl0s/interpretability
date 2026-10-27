@@ -277,6 +277,20 @@ class Patchscopes:
     return self.decoder.layers[layer].register_forward_hook(hook)
 
   @torch.no_grad()
+  def next_logprobs(self, states, layer):
+    """Next-token log-probs over the whole vocabulary after the prompt, with `states` [n, d]
+    injected at `layer`. -> [n, V] on CPU."""
+    n, P = states.shape[0], len(self.prompt_ids)
+    ids = torch.tensor([self.prompt_ids] * n, device=self.device)
+    handle = self._hook(layer, states.to(self.device))
+    try:
+      out = self.mt.model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False,
+                          position_ids=text_position_ids(self.mt, 0, P, n, self.device))
+    finally:
+      handle.remove()
+    return out.logits[:, -1].float().log_softmax(-1).cpu()
+
+  @torch.no_grad()
   def _seq_logp(self, states, layer):
     """Log-likelihood of every continuation, for each injected state. -> [B, S]."""
     n = 1 if states is None else states.shape[0]

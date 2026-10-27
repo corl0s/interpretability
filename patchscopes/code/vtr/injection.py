@@ -121,9 +121,14 @@ class InjectionReadout:
         h.remove()
     return torch.tensor([norms[k] for k in range(len(self.layers))])
 
-  @torch.no_grad()
   def _logp(self, states, positions, layer, norm_match=False, extra_layers=(), add=False):
     """First-token log-prob of every class form after injection. -> [n, S]."""
+    lp = self.next_logprobs(states, positions, layer, norm_match, extra_layers, add)
+    return lp[:, self.first.to(self.device)].cpu()
+
+  @torch.no_grad()
+  def next_logprobs(self, states, positions, layer, norm_match=False, extra_layers=(), add=False):
+    """Next-token log-probs over the whole vocabulary after injection. -> [n, V] on device."""
     n = 1 if states is None else states.shape[0]
     handles = []
     if states is not None:
@@ -147,8 +152,7 @@ class InjectionReadout:
     finally:
       for h in handles:
         h.remove()
-    lp = out.logits[:, -1].float().log_softmax(-1)
-    return lp[:, self.first.to(self.device)].cpu()
+    return out.logits[:, -1].float().log_softmax(-1)
 
   def scores(self, h, layer, positions, norm_match=False, extra_layers=(), add=False):
     """h [n, d]; positions: one list of prompt positions per row. Returns (raw, pmi)."""
