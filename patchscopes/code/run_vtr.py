@@ -18,10 +18,17 @@ Readout names in the outputs:
   selfie_raw, selfie_pmi             the same with the SelfIE-style prompt (5 placeholders)
   *_t<L>_raw, *_t<L>_pmi             Patchscopes / SelfIE injected at fixed target layer L
                                      (--ps_target_layer L) instead of the source layer
+  image_slot_raw, image_slot_pmi     image-slot injection (vtr/injection.py): the state in all
+                                     576 slots of a blank-image prompt; first-token scoring.
+                                     Target per source layer from --slot_target (LLaVA only)
+  oracle_raw, oracle_pmi             the visual activation oracle (train_oracle.py): image-slot
+                                     injection with its trained LoRA, settings from its lora.pt
   probe_linear, probe_mlp            supervised references (availability)
 
   --readouts picks which to compute: logit_lens tuned_lens embedding_lens latentlens
-  patchscopes selfie probe (finished ones are skipped, so new ones can be added later).
+  patchscopes selfie image_slot oracle probe (finished ones are skipped, so new ones can be
+  added later). image_slot and oracle are not in the fair-subset definition (TRAINING_FREE),
+  so adding them leaves the 63 fair classes and the other readouts' numbers unchanged.
 
 Usage on SCC (one GPU):
   # smoke run
@@ -51,7 +58,7 @@ from vtr.readouts import (EmbeddingLens, LatentLens, LogitLens, Patchscopes,  # 
                           TunedLens, class_forms, probe_scores)
 
 MAIN_READOUTS = ["logit_lens", "tuned_lens", "embedding_lens", "latentlens", "patchscopes_pmi",
-                 "selfie_pmi", "probe_linear"]
+                 "selfie_pmi", "image_slot_pmi", "oracle_pmi", "probe_linear"]
 # Readouts whose class coverage defines the fair subset (the probe is a supervised reference;
 # the tuned lens is trained on text only, never on images, so it counts as a readout here).
 # The *_pmi variants are the main injection numbers, fixed before looking at results.
@@ -86,7 +93,7 @@ def parse_args(argv=None):
   p.add_argument("--readouts", nargs="+", default=["logit_lens", "latentlens", "patchscopes",
                                                    "probe"],
                  choices=["logit_lens", "tuned_lens", "embedding_lens", "latentlens",
-                          "patchscopes", "selfie", "probe"])
+                          "patchscopes", "selfie", "image_slot", "oracle", "probe"])
   p.add_argument("--layers", default="all", help="'all' or comma-separated layer indices")
   p.add_argument("--latentlens_bank", default="./results/latentlens_index/bank")
   p.add_argument("--tuned_lens", default="./results/tuned_lens/llava15_tuned_lens.pt",
@@ -94,11 +101,19 @@ def parse_args(argv=None):
   p.add_argument("--ps_prompt", default="identity", choices=["identity", "entity"])
   p.add_argument("--ps_synonyms", action="store_true",
                  help="also score synonyms in Patchscopes (about 2x slower)")
-  p.add_argument("--ps_max_images", type=int, default=0, help="0 = all images")
+  p.add_argument("--ps_max_images", type=int, default=0,
+                 help="0 = all images (applies to every injection readout)")
   p.add_argument("--ps_rows_per_batch", type=int, default=256)
   p.add_argument("--ps_target_layer", type=int, default=None,
                  help="inject Patchscopes / SelfIE states at this target layer instead of the "
                       "source layer (outputs are named e.g. patchscopes_t0_pmi)")
+  p.add_argument("--slot_target", default="dev",
+                 help="image-slot target layer: an int, or 'dev' = the target chosen on "
+                      "development images per source layer (img_all in "
+                      "<out_dir>/injection_proto/proto_best.csv; nearest source for other layers)")
+  p.add_argument("--slot_rows_per_batch", type=int, default=16)
+  p.add_argument("--oracle_dir", default="./results/vtr_llava15/oracle_crop7_add",
+                 help="train_oracle.py output with lora.pt")
   p.add_argument("--probe_splits", type=int, default=5)
   # eval
   p.add_argument("--n_boot", type=int, default=2000)
@@ -134,6 +149,22 @@ def save_scores(path, layers, scores):
 def load_scores(path):
   d = np.load(path)
   return list(d["layers"]), d["scores"].astype(np.float32)
+
+
+def slot_targets(args, layers):
+  """{source layer: image-slot target layer}."""
+  if args.slot_target != "dev":
+    return {l: int(args.slot_target) for l in layers}
+  path = os.path.join(args.out_dir, "injection_proto", "proto_best.csv")
+  if not os.path.exists(path):
+    raise FileNotFoundError(f"{path} not found: run run_injection_proto.py first, or pass "
+                            "--slot_target <layer>")
+  best = pd.read_csv(path)
+  best = best[best["variant"] == "img_all"]
+  chosen = dict(zip(best["source"].astype(int), best["target_chosen_on_dev"].astype(int)))
+  if not chosen:
+    raise ValueError(f"no img_all rows in {path}")
+  return {l: chosen[min(chosen, key=lambda s: (abs(s - l), s))] for l in layers}
 
 
 def run_readouts(args, mt, states, meta, class_names, layers):
@@ -186,20 +217,8 @@ def run_readouts(args, mt, states, meta, class_names, layers):
     ro = EmbeddingLens(mt, class_names, plain, args.device)
     save_scores(os.path.join(score_dir, "embedding_lens.npz"), layers, per_layer(ro.scores))
 
-  # Injection readouts: Patchscopes (identity / entity prompt) and the SelfIE-style prompt.
-  injections = []
-  if "patchscopes" in args.readouts:
-    injections.append(("patchscopes", args.ps_prompt))
-  if "selfie" in args.readouts:
-    injections.append(("selfie", "selfie"))
-  for prefix, prompt in injections:
-    if args.ps_target_layer is not None:
-      prefix = f"{prefix}_t{args.ps_target_layer}"
-    if done(f"{prefix}_raw", f"{prefix}_pmi"):
-      continue
-    print(f"Readout: {prefix} ({prompt} prompt)")
-    ro = Patchscopes(mt, class_names, syn if args.ps_synonyms else plain, prompt,
-                     args.device, rows_per_batch=args.ps_rows_per_batch)
+  def injection(prefix, fn):
+    """fn(h [n, d], source layer) -> (raw, pmi), each [n, n_classes]; saves <prefix>_raw/_pmi."""
     rows = np.arange(len(meta))
     if args.ps_max_images:
       keep = meta["image_id"].drop_duplicates().iloc[:args.ps_max_images]
@@ -218,8 +237,7 @@ def run_readouts(args, mt, states, meta, class_names, layers):
       if l in finished:
         continue
       t0 = time.time()
-      target = l if args.ps_target_layer is None else args.ps_target_layer
-      r, p = ro.scores(states[rows, l].float(), target)
+      r, p = fn(states[rows, l].float(), l)
       raw[i, rows], pmi[i, rows] = r, p
       finished.append(l)
       np.savez(partial, layers=np.asarray(layers), finished=np.asarray(finished), raw=raw,
@@ -228,6 +246,59 @@ def run_readouts(args, mt, states, meta, class_names, layers):
     save_scores(os.path.join(score_dir, f"{prefix}_raw.npz"), layers, raw)
     save_scores(os.path.join(score_dir, f"{prefix}_pmi.npz"), layers, pmi)
     os.remove(partial)
+
+  # Injection readouts: Patchscopes (identity / entity prompt) and the SelfIE-style prompt.
+  injections = []
+  if "patchscopes" in args.readouts:
+    injections.append(("patchscopes", args.ps_prompt))
+  if "selfie" in args.readouts:
+    injections.append(("selfie", "selfie"))
+  for prefix, prompt in injections:
+    if args.ps_target_layer is not None:
+      prefix = f"{prefix}_t{args.ps_target_layer}"
+    if done(f"{prefix}_raw", f"{prefix}_pmi"):
+      continue
+    print(f"Readout: {prefix} ({prompt} prompt)")
+    ro = Patchscopes(mt, class_names, syn if args.ps_synonyms else plain, prompt,
+                     args.device, rows_per_batch=args.ps_rows_per_batch)
+    injection(prefix, lambda h, l, ro=ro: ro.scores(
+        h, l if args.ps_target_layer is None else args.ps_target_layer))
+
+  # Image-slot injection, then the oracle (the same path with its LoRA on).
+  if "image_slot" in args.readouts and not done("image_slot_raw", "image_slot_pmi"):
+    from vtr.injection import InjectionReadout
+    from vtr.oracle import set_lora
+    set_lora(mt, False)  # plain model, even if a LoRA is attached
+    targets = slot_targets(args, layers)
+    print(f"Readout: image_slot (all 576 slots; target per source {targets})")
+    ro = InjectionReadout(mt, class_names, plain, "image", args.device,
+                          rows_per_batch=args.slot_rows_per_batch)
+    injection("image_slot", lambda h, l, ro=ro: ro.scores(
+        h, targets[l], [ro.slots("all")] * h.shape[0]))
+
+  if "oracle" in args.readouts and not done("oracle_raw", "oracle_pmi"):
+    from vtr.injection import InjectionReadout
+    from vtr.oracle import add_lora, lora_parameters, set_lora
+    blob = torch.load(os.path.join(args.oracle_dir, "lora.pt"), weights_only=False)
+    cfg = blob["config"]
+    t, norm_match = cfg["target_layer"], not cfg["no_norm_match"]
+    add = cfg.get("inject", "replace") == "add"
+    print(f"Readout: oracle ({args.oracle_dir}: target {t}, {'add' if add else 'replace'}, "
+          f"norm-matched {norm_match})")
+    if not lora_parameters(mt):
+      add_lora(mt, cfg["rank"], cfg["lora_alpha"])
+    for n, p in lora_parameters(mt).items():
+      p.data.copy_(blob["lora"][n].to(p.device))
+    mt.model.eval()
+    set_lora(mt, True)  # also for the no-injection prior computed in the constructor
+    try:
+      ro = InjectionReadout(mt, class_names, plain, "image", args.device,
+                            rows_per_batch=args.slot_rows_per_batch)
+      ro.ref_norm = blob["ref_norm"]  # the norms the oracle was trained with
+      injection("oracle", lambda h, l, ro=ro: ro.scores(
+          h, t, [ro.slots("all")] * h.shape[0], norm_match, add=add))
+    finally:
+      set_lora(mt, False)
 
   if "probe" in args.readouts:
     for kind in ("linear", "mlp"):

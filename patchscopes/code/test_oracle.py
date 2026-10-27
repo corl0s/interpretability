@@ -5,6 +5,7 @@
   * slot injection is differentiable: gradients reach LoRA layers after the injection layer
   * train_oracle end to end on a tiny random LLaVA: data (benchmark images excluded), training
     (LoRA weights move, held-out answers dropped), eval tables
+  * run_vtr's image_slot / oracle readouts on every row reproduce the oracle's own eval cell
 
   python test_oracle.py
 """
@@ -21,7 +22,9 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import run_vtr  # noqa: E402
 import train_oracle  # noqa: E402
+from run_ps_sweep import select_rows  # noqa: E402
 from test_rewind import add_unlabeled_images  # noqa: E402
 from test_visual_object_identification import build_tiny_vlm, make_fake_coco  # noqa: E402
 from vtr.cache import cache_states  # noqa: E402
@@ -151,6 +154,30 @@ def main():
     main_obj = pd.read_csv(os.path.join(ev, "main_object.csv"))
     assert set(main_obj["main_object"]) <= set(class_names)
     print("eval OK (oracle differs from the untrained model; seen/held-out and easy/hard tables)")
+
+    # run_vtr's image_slot and oracle readouts on every row (full-benchmark evaluation).
+    proto = os.path.join(vtr_dir, "injection_proto")
+    os.makedirs(proto)
+    pd.DataFrame({"variant": ["img_all", "img_all", "img_own"], "source": [0, 2, 0],
+                  "target_chosen_on_dev": [1, 0, 2]}).to_csv(
+        os.path.join(proto, "proto_best.csv"), index=False)
+    args = run_vtr.parse_args(["--out_dir", vtr_dir, "--device", "cpu", "--oracle_dir", out_dir,
+                               "--readouts", "image_slot", "oracle", "--slot_rows_per_batch", "4"])
+    assert run_vtr.slot_targets(args, [0, 1, 2, 3]) == {0: 1, 1: 1, 2: 0, 3: 0}
+    run_vtr.run_readouts(args, mt, states, meta, class_names, [0, 2])
+    sc = {n: run_vtr.load_scores(os.path.join(vtr_dir, "scores", f"{n}.npz"))
+          for n in ("image_slot_pmi", "oracle_pmi", "oracle_raw")}
+    for n, (ls, s) in sc.items():
+      assert ls == [0, 2] and s.shape == (2, len(meta), len(class_names)), (n, s.shape)
+      assert np.isfinite(s).all(), n
+    assert not np.allclose(sc["image_slot_pmi"][1], sc["oracle_pmi"][1])
+    oracle_s2 = sc["oracle_pmi"][1][1]  # source layer 2
+    assert not any(m.enabled for m in mt.model.modules() if hasattr(m, "enabled"))
+    # The oracle readout reproduces train_oracle's own eval cell (source 2, target 1).
+    cell = np.load(os.path.join(ev, "cells", "oracle", "s2_t1.npz"))["pmi"].astype(np.float32)
+    rows = select_rows(meta, 4, 0)
+    assert np.allclose(oracle_s2[rows], cell, atol=2e-2), np.abs(oracle_s2[rows] - cell).max()
+    print("run_vtr image_slot + oracle readouts OK (all rows, LoRA off afterwards)")
 
     try:  # the pilot's box3 shards cannot be mixed with another label view
       train_oracle.main(common + ["--stage", "data", "--label_view", "crop7"], mt=mt)
