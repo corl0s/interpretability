@@ -6,12 +6,14 @@
   * train_oracle end to end on a tiny random LLaVA: data (benchmark images excluded), training
     (LoRA weights move, held-out answers dropped), eval tables
   * run_vtr's image_slot / oracle readouts on every row reproduce the oracle's own eval cell
+  * run_vtr's slot_nn (image-slot + LatentLens): offset 0 equals LatentLens on h; nested bank
 
   python test_oracle.py
 """
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 
@@ -22,14 +24,17 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import compare_slot_nn  # noqa: E402
 import run_vtr  # noqa: E402
 import train_oracle  # noqa: E402
 from run_ps_sweep import select_rows  # noqa: E402
 from test_rewind import add_unlabeled_images  # noqa: E402
+from test_vtr import test_latentlens  # noqa: E402
 from test_visual_object_identification import build_tiny_vlm, make_fake_coco  # noqa: E402
 from vtr.cache import cache_states  # noqa: E402
 from vtr.data import select_object_samples  # noqa: E402
 from vtr.geometry import Llava15Geometry  # noqa: E402
+from vtr.readouts import LatentLens, class_forms  # noqa: E402
 from vtr.oracle import (LoRALinear, add_lora, clean_answer, draw_box,  # noqa: E402
                         lora_parameters, set_lora, slot_injection, square_crop)
 from visual_object_identification import get_decoder  # noqa: E402
@@ -178,6 +183,35 @@ def main():
     rows = select_rows(meta, 4, 0)
     assert np.allclose(oracle_s2[rows], cell, atol=2e-2), np.abs(oracle_s2[rows] - cell).max()
     print("run_vtr image_slot + oracle readouts OK (all rows, LoRA off afterwards)")
+
+    # slot_nn: image-slot injection read by LatentLens, on a bank nested one level down (the
+    # layout extract_embeddings.py writes).
+    flat = test_latentlens(mt, class_names, tmp)
+    bank_dir = os.path.join(tmp, "nested_bank")
+    shutil.copytree(flat, os.path.join(bank_dir, "some-model"))
+    args = run_vtr.parse_args(["--out_dir", vtr_dir, "--device", "cpu", "--readouts", "slot_nn",
+                               "--slot_rows_per_batch", "4", "--latentlens_bank", bank_dir,
+                               "--latentlens_name", "llvg", "--nn_offsets", "0,1,5"])
+    run_vtr.run_readouts(args, mt, states, meta, class_names, [0, 2])
+    names = ["img_k0", "img_k1", "img_k5", "ans_k1", "ans_k5"]
+    nn = {n: run_vtr.load_scores(os.path.join(vtr_dir, "scores", f"slot_nn_llvg_{n}.npz"))[1]
+          for n in names}
+    assert not os.path.exists(os.path.join(vtr_dir, "scores", "slot_nn_llvg_ans_k0.npz"))
+    for n, s in nn.items():
+      assert s.shape == (2, len(meta), len(class_names)) and not np.isnan(s).any(), n
+    # Offset 0 reads the injected slots right after injection: plain LatentLens on h.
+    plain = LatentLens(bank_dir, mt.tokenizer, class_names,
+                       class_forms(class_names, synonyms=False), "cpu")
+    for i, l in enumerate([0, 2]):
+      ref = plain.scores(states[:, l].float())
+      assert np.allclose(nn["img_k0"][i], ref, atol=2e-3), np.abs(nn["img_k0"][i] - ref).max()
+    assert not np.allclose(nn["img_k1"], nn["img_k0"])
+    assert not np.allclose(nn["ans_k1"], nn["img_k1"])
+    compare_slot_nn.main(["--out_dir", vtr_dir, "--bank_name", "llvg", "--n_images", "2",
+                          "--n_boot", "20"])
+    cmp = pd.read_csv(os.path.join(vtr_dir, "slot_nn", "compare_llvg.csv"))
+    assert {"slot_nn_llvg_img_k0", "image_slot_pmi", "oracle_pmi"} <= set(cmp["readout"])
+    print("run_vtr slot_nn OK (offset 0 = LatentLens on h; nested bank found; comparison table)")
 
     try:  # the pilot's box3 shards cannot be mixed with another label view
       train_oracle.main(common + ["--stage", "data", "--label_view", "crop7"], mt=mt)

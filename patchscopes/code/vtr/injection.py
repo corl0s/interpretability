@@ -19,6 +19,9 @@ Scoring is first-token closed-set: a class scores the best log-probability of th
 " <form>" after the prompt, raw and PMI (minus the same with no injection). That needs one
 forward pass per state, so ~600-token image prompts stay cheap. On the fair subset no two
 classes share a first sub-token, so ranks there are unaffected by the approximation.
+
+read_states returns the second pass's hidden states instead (answer position and injected slots),
+for a nearest-neighbour readout of them (run_vtr.py's slot_nn: image-slot injection + LatentLens).
 """
 
 import numpy as np
@@ -130,8 +133,50 @@ class InjectionReadout:
   def next_logprobs(self, states, positions, layer, norm_match=False, extra_layers=(), add=False):
     """Next-token log-probs over the whole vocabulary after injection. -> [n, V] on device."""
     n = 1 if states is None else states.shape[0]
+    handles = self._inject_hooks(states, positions, layer, norm_match, extra_layers, add)
+    try:
+      out = self.mt.model(**self._batch_inputs(n), use_cache=False)
+    finally:
+      for h in handles:
+        h.remove()
+    return out.logits[:, -1].float().log_softmax(-1)
+
+  @torch.no_grad()
+  def read_states(self, states, positions, layer, read_layers, norm_match=False, add=False):
+    """Inject, then read the hidden states the second pass produces (for nearest-neighbour
+    readouts). Returns {r: (answer [n, d], slots [n, d])} on CPU, float32: the output of block r
+    at the last prompt position, and averaged over the injected positions."""
+    n = states.shape[0]
+    handles = self._inject_hooks(states, positions, layer, norm_match, (), add)
+    width = max(len(p) for p in positions)
+    pos = torch.tensor([p + [p[0]] * (width - len(p)) for p in positions], device=self.device)
+    mask = torch.tensor([[1.0] * len(p) + [0.0] * (width - len(p)) for p in positions],
+                        device=self.device)
+    rows = torch.arange(n, device=self.device)[:, None].expand_as(pos)
+    got = {}
+
+    def capture(module, inp, out, r):
+      hs = (out[0] if isinstance(out, tuple) else out).float()
+      slots = (hs[rows, pos] * mask[..., None]).sum(1) / mask.sum(1, keepdim=True)
+      got[r] = (hs[:, -1].cpu(), slots.cpu())
+
+    # Registered after the injection hooks, so a read at the injection layer sees the injected
+    # states.
+    handles += [self.layers[r].register_forward_hook(
+        lambda m, i, o, r=r: capture(m, i, o, r)) for r in sorted(set(read_layers))]
+    try:
+      self.mt.model(**self._batch_inputs(n), use_cache=False)
+    finally:
+      for h in handles:
+        h.remove()
+    return got
+
+  def _inject_hooks(self, states, positions, layer, norm_match, extra_layers, add):
+    """Forward hooks that write `states` into `positions` at the output of block `layer` (and
+    `layer` + each extra offset). None = no injection."""
     handles = []
     if states is not None:
+      n = states.shape[0]
       states = states.to(self.device).float()
       width = max(len(p) for p in positions)
       pos = torch.tensor([p + [p[0]] * (width - len(p)) for p in positions], device=self.device)
@@ -147,12 +192,7 @@ class InjectionReadout:
           v = vec.to(hs.dtype)[:, None, :].expand(-1, pos.shape[1], -1)
           hs[rows, pos] = hs[rows, pos] + v if add else v
         handles.append(self.layers[l].register_forward_hook(hook))
-    try:
-      out = self.mt.model(**self._batch_inputs(n), use_cache=False)
-    finally:
-      for h in handles:
-        h.remove()
-    return out.logits[:, -1].float().log_softmax(-1)
+    return handles
 
   def scores(self, h, layer, positions, norm_match=False, extra_layers=(), add=False):
     """h [n, d]; positions: one list of prompt positions per row. Returns (raw, pmi)."""

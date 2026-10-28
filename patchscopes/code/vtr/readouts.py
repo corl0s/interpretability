@@ -18,6 +18,7 @@ or "bag" cannot tell classes apart and are dropped).
   probe_scores  supervised linear / MLP probe, images grouped across folds (availability)
 """
 
+import glob
 import os
 from collections import Counter
 
@@ -151,9 +152,12 @@ class LatentLens:
   def __init__(self, bank_dir, tokenizer, class_names, forms, device, cache_file=None):
     self.device = device
     self.n_classes = len(class_names)
+    # layer_N/ directly under bank_dir, or one level down (extract_embeddings.py nests it under
+    # the model name).
     layer_files = sorted(
-        (int(d.split("_")[1]), os.path.join(bank_dir, d, "embeddings_cache.pt"))
-        for d in os.listdir(bank_dir) if d.startswith("layer_"))
+        (int(os.path.basename(os.path.dirname(f)).split("_")[1]), f)
+        for pattern in ("layer_*", os.path.join("*", "layer_*"))
+        for f in glob.glob(os.path.join(bank_dir, pattern, "embeddings_cache.pt")))
     if not layer_files:
       raise FileNotFoundError(f"no layer_*/embeddings_cache.pt under {bank_dir}")
     if cache_file and os.path.exists(cache_file):
@@ -161,18 +165,18 @@ class LatentLens:
       cols, cls = saved["cols"], saved["cls"]
     else:
       # Metadata is identical for every bank layer; match class names on the first one.
-      first = torch.load(layer_files[0][1], map_location="cpu", weights_only=False)
+      first = torch.load(layer_files[0][1], map_location="cpu", weights_only=False, mmap=True)
       cols, cls = _match_bank_entries(first["metadata"], tokenizer, class_names, forms)
       del first
       if cache_file:
         np.savez(cache_file, cols=cols, cls=cls)
     self.cls = torch.as_tensor(cls, device=device)
     dtype = torch.float16 if torch.device(device).type == "cuda" else torch.float32
-    # Only bank entries that name some class can contribute a class score; load one layer at a
-    # time and keep just those rows (the full bank is ~3 GB per layer).
+    # Only bank entries that name some class can contribute a class score; map one layer at a
+    # time and keep just those rows (a full bank is several GB per layer).
     self.emb = {}
     for layer, path in layer_files:
-      data = torch.load(path, map_location="cpu", weights_only=False)
+      data = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
       rows = data["embeddings"][torch.as_tensor(cols)].float()
       self.emb[layer] = F.normalize(rows, dim=-1).to(device, dtype)
       del data

@@ -23,10 +23,14 @@ Readout names in the outputs:
                                      Target per source layer from --slot_target (LLaVA only)
   oracle_raw, oracle_pmi             the visual activation oracle (train_oracle.py): image-slot
                                      injection with its trained LoRA, settings from its lora.pt
+  slot_nn_<bank>_img_k<K>            image-slot injection read by LatentLens: the second pass's
+  slot_nn_<bank>_ans_k<K>            states at block target + K, averaged over the image slots
+                                     (img) or at the answer position (ans), nearest neighbours in
+                                     the bank (<bank> = --latentlens_name; offsets --nn_offsets)
   probe_linear, probe_mlp            supervised references (availability)
 
   --readouts picks which to compute: logit_lens tuned_lens embedding_lens latentlens
-  patchscopes selfie image_slot oracle probe (finished ones are skipped, so new ones can be
+  patchscopes selfie image_slot oracle slot_nn probe (finished ones are skipped, so new ones can be
   added later). image_slot and oracle are not in the fair-subset definition (TRAINING_FREE),
   so adding them leaves the 63 fair classes and the other readouts' numbers unchanged.
 
@@ -56,6 +60,7 @@ from vtr.data import select_object_samples, select_same_images, summarize_sample
 from vtr.geometry import GEOMETRIES  # noqa: E402
 from vtr.readouts import (EmbeddingLens, LatentLens, LogitLens, Patchscopes,  # noqa: E402
                           TunedLens, class_forms, probe_scores)
+from visual_object_identification import get_decoder  # noqa: E402
 
 MAIN_READOUTS = ["logit_lens", "tuned_lens", "embedding_lens", "latentlens", "patchscopes_pmi",
                  "selfie_pmi", "image_slot_pmi", "oracle_pmi", "probe_linear"]
@@ -93,9 +98,14 @@ def parse_args(argv=None):
   p.add_argument("--readouts", nargs="+", default=["logit_lens", "latentlens", "patchscopes",
                                                    "probe"],
                  choices=["logit_lens", "tuned_lens", "embedding_lens", "latentlens",
-                          "patchscopes", "selfie", "image_slot", "oracle", "probe"])
+                          "patchscopes", "selfie", "image_slot", "oracle", "slot_nn", "probe"])
   p.add_argument("--layers", default="all", help="'all' or comma-separated layer indices")
   p.add_argument("--latentlens_bank", default="./results/latentlens_index/bank")
+  p.add_argument("--latentlens_name", default="latentlens",
+                 help="output name of the LatentLens readout (and the slot_nn_<name>_* outputs), "
+                      "so a run on another bank does not overwrite the default one")
+  p.add_argument("--nn_offsets", default="0,2,4,8,16",
+                 help="slot_nn: read the second pass at target + each offset")
   p.add_argument("--tuned_lens", default="./results/tuned_lens/llava15_tuned_lens.pt",
                  help="translators from train_tuned_lens.py")
   p.add_argument("--ps_prompt", default="identity", choices=["identity", "entity"])
@@ -195,7 +205,8 @@ def run_readouts(args, mt, states, meta, class_names, layers):
       save_scores(os.path.join(score_dir, f"{name}.npz"), layers, per_layer(ro.scores))
 
   if "latentlens" in args.readouts:
-    for name, forms in (("latentlens", plain), ("latentlens_syn", syn)):
+    ll = args.latentlens_name
+    for name, forms in ((ll, plain), (f"{ll}_syn", syn)):
       if done(name):
         continue
       print(f"Readout: {name} (bank: {args.latentlens_bank})")
@@ -217,34 +228,34 @@ def run_readouts(args, mt, states, meta, class_names, layers):
     ro = EmbeddingLens(mt, class_names, plain, args.device)
     save_scores(os.path.join(score_dir, "embedding_lens.npz"), layers, per_layer(ro.scores))
 
-  def injection(prefix, fn):
-    """fn(h [n, d], source layer) -> (raw, pmi), each [n, n_classes]; saves <prefix>_raw/_pmi."""
+  def injection(prefix, fn, suffixes=("raw", "pmi")):
+    """fn(h [n, d], source layer) -> one [n, n_classes] array per suffix (default (raw, pmi));
+    saves <prefix>_<suffix>.npz."""
     rows = np.arange(len(meta))
     if args.ps_max_images:
       keep = meta["image_id"].drop_duplicates().iloc[:args.ps_max_images]
       rows = np.flatnonzero(meta["image_id"].isin(keep).to_numpy())
-    raw = np.full((len(layers), len(meta), len(class_names)), np.nan, dtype=np.float32)
-    pmi = raw.copy()
+    out = {s: np.full((len(layers), len(meta), len(class_names)), np.nan, dtype=np.float32)
+           for s in suffixes}
     # Layer-level checkpoint, so a job stopped by its time limit resumes where it was.
     partial = os.path.join(score_dir, f"{prefix}_partial.npz")
     finished = []
     if os.path.exists(partial):
       ck = np.load(partial)
-      if list(ck["layers"]) == list(layers):
-        raw, pmi, finished = ck["raw"], ck["pmi"], list(ck["finished"])
+      if list(ck["layers"]) == list(layers) and all(s in ck for s in suffixes):
+        out, finished = {s: ck[s] for s in suffixes}, list(ck["finished"])
         print(f"    resuming: layers {finished} already done")
     for i, l in enumerate(layers):
       if l in finished:
         continue
       t0 = time.time()
-      r, p = fn(states[rows, l].float(), l)
-      raw[i, rows], pmi[i, rows] = r, p
+      for s, v in zip(suffixes, fn(states[rows, l].float(), l)):
+        out[s][i, rows] = v
       finished.append(l)
-      np.savez(partial, layers=np.asarray(layers), finished=np.asarray(finished), raw=raw,
-               pmi=pmi)
+      np.savez(partial, layers=np.asarray(layers), finished=np.asarray(finished), **out)
       print(f"    layer {l}: {len(rows)} rows ({time.time() - t0:.1f}s)", flush=True)
-    save_scores(os.path.join(score_dir, f"{prefix}_raw.npz"), layers, raw)
-    save_scores(os.path.join(score_dir, f"{prefix}_pmi.npz"), layers, pmi)
+    for s in suffixes:
+      save_scores(os.path.join(score_dir, f"{prefix}_{s}.npz"), layers, out[s])
     os.remove(partial)
 
   # Injection readouts: Patchscopes (identity / entity prompt) and the SelfIE-style prompt.
@@ -299,6 +310,45 @@ def run_readouts(args, mt, states, meta, class_names, layers):
           h, t, [ro.slots("all")] * h.shape[0], norm_match, add=add))
     finally:
       set_lora(mt, False)
+
+  # Image-slot injection read by nearest neighbours: inject at the image-slot target t, take the
+  # second pass's states at blocks t + k, and score them with LatentLens (cosine to the text
+  # bank). Two read-outs per offset: the answer position (ans; k > 0, since the answer position
+  # only sees the injection through later attention) and the mean over the injected slots (img;
+  # k = 0 is plain LatentLens on h, a sanity check).
+  if "slot_nn" in args.readouts:
+    from vtr.injection import InjectionReadout
+    from vtr.oracle import set_lora
+    offsets = [int(k) for k in args.nn_offsets.split(",")]
+    suffixes = [f"img_k{k}" for k in offsets] + [f"ans_k{k}" for k in offsets if k > 0]
+    prefix = f"slot_nn_{args.latentlens_name}"
+    if not done(*(f"{prefix}_{s}" for s in suffixes)):
+      set_lora(mt, False)
+      targets = slot_targets(args, layers)
+      last = len(get_decoder(mt).layers) - 1
+      print(f"Readout: {prefix} (target per source {targets}; read at t + {offsets}, capped at "
+            f"{last}; bank {args.latentlens_bank})")
+      ro = InjectionReadout(mt, class_names, plain, "image", args.device,
+                            rows_per_batch=args.slot_rows_per_batch)
+      nn = LatentLens(args.latentlens_bank, mt.tokenizer, class_names, plain, args.device,
+                      cache_file=os.path.join(score_dir, f"{args.latentlens_name}_entries.npz"))
+
+      def slot_nn(h, l):
+        t = targets[l]
+        read = {k: min(t + k, last) for k in offsets}
+        out = {s: [] for s in suffixes}
+        for start in range(0, h.shape[0], ro.batch):
+          hb = h[start:start + ro.batch]
+          got = ro.read_states(hb, [ro.slots("all")] * hb.shape[0], t, set(read.values()))
+          for k, r in read.items():
+            ans, img = got[r]
+            out[f"img_k{k}"].append(nn.scores(img))
+            if k > 0:
+              out[f"ans_k{k}"].append(nn.scores(ans))
+        return [np.concatenate(out[s]) for s in suffixes]
+
+      injection(prefix, slot_nn, suffixes)
+      del nn
 
   if "probe" in args.readouts:
     for kind in ("linear", "mlp"):
