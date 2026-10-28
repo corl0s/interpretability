@@ -15,6 +15,11 @@
 
 set -e
 module load miniconda
+# vLLM JIT-compiles some kernels at startup and needs nvcc (it is only on PATH via the cuda module).
+# The vllm env's torch is built for CUDA 13.0, so use a 13.x toolkit (the default module is 12.8).
+module load cuda/13.2
+export CUDA_HOME=$(dirname $(dirname $(which nvcc)))
+nvcc --version | tail -n 1
 conda activate vllm
 export HF_HOME=/projectnb/mlresearch/vishnuav/hf_cache
 cd /projectnb/mlresearch/vishnuav/interpretability/patchscopes/code
