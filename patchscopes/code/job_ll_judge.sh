@@ -2,6 +2,7 @@
 # LatentLens protocol, part 3: the open-weight judge (Qwen3-VL-30B-A3B-Instruct-FP8, served by
 # vLLM on this GPU) scores every readout with their evaluate_interpretability.py; the 7 readouts
 # run as parallel clients so vLLM batches them. Then the summary table.
+# Only the replies that did not parse, judged again:  qsub -v STAGE=rejudge job_ll_judge.sh
 # Run after job_ll_prep.sh and job_ll_bank.sh. Needs the conda env `vllm` (see the runbook).
 #$ -P mlresearch
 #$ -N ll_judge
@@ -25,6 +26,7 @@ export HF_HOME=/projectnb/mlresearch/vishnuav/hf_cache
 cd /projectnb/mlresearch/vishnuav/interpretability/patchscopes/code
 
 OUT=./results/ll_llava15
+STAGE=${STAGE:-judge}
 JUDGE=Qwen/Qwen3-VL-30B-A3B-Instruct-FP8
 vllm serve $JUDGE --port 8000 --max-model-len 16384 --gpu-memory-utilization 0.90 \
     --limit-mm-per-prompt '{"image": 2}' > logs/ll_vllm.log 2>&1 &

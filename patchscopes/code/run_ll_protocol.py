@@ -25,11 +25,15 @@ Stages (run in this order; see job_ll_*.sh):
               injection, visual oracle (top-5 next tokens, raw, like their logit lens)
   judge       their evaluate_interpretability.py, with an open-weight judge behind an
               OpenAI-compatible server (vLLM) instead of GPT-5
+  rejudge     judge again only the patches whose reply did not parse (see make_judgment)
   summary     % interpretable per readout and layer (+ Wilson 95% CI, relation types)
 
 Deviations from the paper (state them when reporting):
   * the judge is open-weight (default Qwen3-VL-30B-A3B-Instruct-FP8), not GPT-5; max_tokens is
     raised from 1000 so its reasoning is not cut off before the JSON, temperature 0
+  * replies that are not valid JSON are repaired (missing / trailing commas, Python booleans),
+    else asked again once with the output constrained to their JSON fields; their parser
+    counts any such reply as not interpretable
   * their validation split was drawn after dropping dead image URLs, which cannot be replayed;
     we draw it from the full list with their seed and skip dead URLs, so the images are a
     different random sample from the same distribution
@@ -45,6 +49,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 from collections import defaultdict
 
@@ -68,7 +73,7 @@ def parse_args(argv=None):
                               formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("--stage", required=True,
                  choices=["fetch", "extract", "export_lm", "latentlens", "plan", "ours", "judge",
-                          "summary"])
+                          "rejudge", "summary"])
   p.add_argument("--out_dir", default="./results/ll_llava15")
   p.add_argument("--ll_repo", default="../../../external/latentlens",
                  help="clone of github.com/McGill-NLP/latentlens")
@@ -93,6 +98,7 @@ def parse_args(argv=None):
   p.add_argument("--judge_url", default="http://localhost:8000/v1")
   p.add_argument("--judge_model", default="Qwen/Qwen3-VL-30B-A3B-Instruct-FP8")
   p.add_argument("--judge_max_tokens", type=int, default=2048)
+  p.add_argument("--judge_threads", type=int, default=4, help="rejudge: parallel requests")
   return p.parse_args(argv)
 
 
@@ -434,35 +440,75 @@ def stage_ours(args, mt):
 # ---------------------------------------------------------------------------------- judge
 
 
-def stage_judge(args):
-  """Their judge loop unchanged, with the OpenAI client pointed at a local server."""
-  from openai import OpenAI
-  ev = ll_eval_module(args, "evaluate_interpretability")
-  client = OpenAI(base_url=args.judge_url, api_key="EMPTY")
-  ev.OpenAI = lambda **kw: client
+UNPARSED = "Could not parse response"
+JUDGMENT_SCHEMA = {
+    "type": "object",
+    "properties": {"reasoning": {"type": "string"}, "interpretable": {"type": "boolean"},
+                   **{k: {"type": "array", "items": {"type": "string"}}
+                      for k in ("concrete_words", "abstract_words", "global_words")}},
+    "required": ["reasoning", "interpretable", "concrete_words", "abstract_words",
+                 "global_words"]}
+
+
+def parse_judgment(text):
+  """Their parser (outermost {...} -> json.loads), then repairs for slips an open judge makes
+  copying their output template, which has no commas after two of its fields: missing commas
+  between fields, trailing commas, Python booleans. None if it still fails."""
+  i, j = text.find("{"), text.rfind("}") + 1
+  if i == -1 or j <= i:
+    return None
+  s = text[i:j]
+  try:
+    return json.loads(s)
+  except json.JSONDecodeError:
+    pass
+  s = re.sub(r'(["\]}]|true|false|\d)\s*\n(\s*")', r"\1,\n\2", s)
+  s = re.sub(r",(\s*[}\]])", r"\1", s)
+  s = re.sub(r":\s*True\b", ": true", re.sub(r":\s*False\b", ": false", s))
+  try:
+    return json.loads(s)
+  except json.JSONDecodeError:
+    return None
+
+
+def make_judgment(args, ev, client):
+  """Their OpenRouter branch (chat.completions; image, prompt, crop) with more tokens, T=0 and a
+  forgiving parser. A reply that still does not parse is asked again once with the output
+  constrained to their JSON fields (vLLM structured output); if that fails too, it is kept as
+  their unparsed fallback (not interpretable) with the full reply in "raw"."""
 
   def judgment(_, image_with_bbox, cropped_image, candidate_words, model="", api_provider=""):
-    # Their OpenRouter branch (chat.completions; image, prompt, crop), with more tokens and T=0.
     content = [{"type": "image_url", "image_url": {"url": ev.encode_image(image_with_bbox)}},
                {"type": "text",
                 "text": ev.IMAGE_PROMPT_WITH_CROP.format(candidate_words=str(candidate_words))}]
     if cropped_image is not None:
       content.append({"type": "image_url",
                       "image_url": {"url": ev.encode_image(cropped_image)}})
-    resp = client.chat.completions.create(model=args.judge_model, max_tokens=args.judge_max_tokens,
-                                          temperature=0.0,
-                                          messages=[{"role": "user", "content": content}])
-    text = resp.choices[0].message.content or ""
-    i, j = text.find("{"), text.rfind("}") + 1
-    if i != -1 and j > i:
-      try:
-        return json.loads(text[i:j])
-      except json.JSONDecodeError:
-        pass
+    texts = []
+    for constrained in (False, True):
+      extra = {"response_format": {"type": "json_schema", "json_schema": {
+          "name": "judgment", "schema": JUDGMENT_SCHEMA}}} if constrained else {}
+      resp = client.chat.completions.create(
+          model=args.judge_model, max_tokens=args.judge_max_tokens, temperature=0.0,
+          messages=[{"role": "user", "content": content}], **extra)
+      texts.append(resp.choices[0].message.content or "")
+      out = parse_judgment(texts[-1])
+      if out is not None:
+        out["parse"] = "constrained" if constrained else "free"
+        return out
     return {"interpretable": False, "concrete_words": [], "abstract_words": [],
-            "global_words": [], "reasoning": f"Could not parse response: {text[:200]}"}
+            "global_words": [], "reasoning": f"{UNPARSED}: {texts[0][:200]}", "raw": texts}
 
-  ev.get_llm_judgment = judgment
+  return judgment
+
+
+def stage_judge(args):
+  """Their judge loop unchanged, with the OpenAI client pointed at a local server."""
+  from openai import OpenAI
+  ev = ll_eval_module(args, "evaluate_interpretability")
+  client = OpenAI(base_url=args.judge_url, api_key="EMPTY")
+  ev.OpenAI = lambda **kw: client
+  ev.get_llm_judgment = make_judgment(args, ev, client)
   names = [args.readout] if args.readout else list(THEIRS) + list(OURS)
   for name in names:
     ns = argparse.Namespace(
@@ -472,6 +518,57 @@ def stage_judge(args):
         num_patches=args.num_patches, num_samples_per_image=1, top_k=TOP_K,
         model_name="llava", seed=JUDGE_SEED)
     ev.evaluate_model(ns)
+
+
+def stage_rejudge(args):
+  """Judge again only the patches whose reply did not parse, with the same inputs their loop
+  built (image with the red 3x3 box, and the crop) and make_judgment's repairs. The original
+  results are kept as evaluation_results.orig.json."""
+  from concurrent.futures import ThreadPoolExecutor
+  from openai import OpenAI
+  ev = ll_eval_module(args, "evaluate_interpretability")
+  client = OpenAI(base_url=args.judge_url, api_key="EMPTY")
+  judgment = make_judgment(args, ev, client)
+  bbox_size = 3
+  names = [args.readout] if args.readout else list(THEIRS) + list(OURS)
+  for name in names:
+    path = os.path.join(paths(args)["judge"], name, "evaluation_results.json")
+    with open(path, encoding="utf-8") as f:
+      res = json.load(f)
+    backup = path.replace(".json", ".orig.json")
+    if not os.path.exists(backup):
+      write_json(backup, res)
+    todo = [(layer, p) for layer in res for p in layer["patches"]
+            if UNPARSED in str(p["judgment"].get("reasoning", ""))]
+    print(f"{name}: re-judging {len(todo)} unparsed patches", flush=True)
+
+    def redo(item):
+      layer, p = item
+      img, _ = ev.process_image_with_mask(ev.find_image_path(paths(args)["images"],
+                                                             p["image_idx"]), model_name="llava")
+      patch_size = 512.0 / layer["grid_size"]
+      row, col = p["patch_row"] - bbox_size // 2, p["patch_col"] - bbox_size // 2
+      boxed = ev.draw_bbox_on_image(img, ev.calculate_square_bbox_from_patch(
+          row, col, patch_size=patch_size, size=bbox_size))
+      crop = img.crop((max(0, int(col * patch_size)), max(0, int(row * patch_size)),
+                       min(int((col + bbox_size) * patch_size), img.size[0]),
+                       min(int((row + bbox_size) * patch_size), img.size[1])))
+      j = judgment(None, boxed, crop, p["candidate_words"])
+      p["judgment"] = j
+      p["interpretable"] = any(len(j.get(k, [])) > 0
+                               for k in ("concrete_words", "abstract_words", "global_words"))
+      return j.get("parse", "failed")
+
+    with ThreadPoolExecutor(args.judge_threads) as pool:
+      outcome = list(pool.map(redo, todo))
+    for layer in res:
+      layer["interpretable_count"] = sum(p["interpretable"] for p in layer["patches"])
+      layer["total_count"] = len(layer["patches"])
+      layer["interpretable_fraction"] = (layer["interpretable_count"] / layer["total_count"]
+                                         if layer["total_count"] else 0.0)
+    write_json(path, res)
+    print(f"{name}: " + ", ".join(f"{k} {outcome.count(k)}"
+                                  for k in ("free", "constrained", "failed")), flush=True)
 
 
 # -------------------------------------------------------------------------------- summary
@@ -533,7 +630,8 @@ def main(argv=None, mt=None):
   return {"fetch": lambda: stage_fetch(args), "extract": lambda: stage_extract(args, mt),
           "export_lm": lambda: stage_export_lm(args, mt), "latentlens": lambda: stage_latentlens(args),
           "plan": lambda: stage_plan(args), "ours": lambda: stage_ours(args, mt),
-          "judge": lambda: stage_judge(args), "summary": lambda: stage_summary(args)}[args.stage]()
+          "judge": lambda: stage_judge(args), "rejudge": lambda: stage_rejudge(args),
+          "summary": lambda: stage_summary(args)}[args.stage]()
 
 
 if __name__ == "__main__":

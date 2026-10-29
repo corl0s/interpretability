@@ -47,18 +47,26 @@ def stub_torchvision():
 
 
 class FakeOpenAI:
-  """Stands in for the vLLM server: 'interpretable' iff a candidate word starts with a letter."""
+  """Stands in for the vLLM server: 'interpretable' iff a candidate word starts with a letter.
+  With broken = True, free replies copy their template's missing commas (odd calls) or are not
+  JSON at all (even calls); constrained replies (response_format) are always valid."""
+  broken = False
+  calls = 0
 
   def __init__(self, **kw):
     self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self.create))
 
-  def create(self, model, messages, max_tokens, temperature):
+  def create(self, model, messages, max_tokens, temperature, response_format=None):
     text = next(c["text"] for c in messages[0]["content"] if c["type"] == "text")
     words = text.split("Here are the candidate words:")[1].split("###")[0]
     ok = any(ch.isalpha() for ch in words)
     reply = json.dumps({"reasoning": "fake", "interpretable": ok,
                         "concrete_words": ["w"] if ok else [], "abstract_words": [],
-                        "global_words": []})
+                        "global_words": []}, indent=4)
+    if FakeOpenAI.broken and response_format is None:
+      FakeOpenAI.calls += 1
+      reply = (reply.replace('],\n    "abstract', ']\n    "abstract') if FakeOpenAI.calls % 2
+               else "I cannot produce JSON {here")
     msg = types.SimpleNamespace(content="Thinking... " + reply)
     return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
 
@@ -155,6 +163,28 @@ def main():
     df = R.main(["--stage", "summary"] + base)
     assert set(df["readout"]) == set(R.THEIRS) | set(R.OURS)
     assert (df["n"] == n_patch).all() and (df["off_plan"] == 0).all()
+    assert (df["unparsed"] == 0).all()
+
+    # rejudge: mark some patches unparsed, then judge them again with replies that need repair
+    # (missing comma) or a constrained retry (not JSON)
+    assert R.parse_judgment('x {"a": [1]\n "b": true,\n}') == {"a": [1], "b": True}
+    path = os.path.join(tmp, "judge", "latentlens", "evaluation_results.json")
+    res = json.load(open(path))
+    before = [[p["interpretable"] for p in layer["patches"]] for layer in res]
+    for layer in res:
+      for p in layer["patches"][::2]:
+        p["judgment"] = {"reasoning": R.UNPARSED + ": ...", "concrete_words": []}
+        p["interpretable"] = False
+    json.dump(res, open(path, "w"))
+    FakeOpenAI.broken = True
+    R.main(["--stage", "rejudge", "--readout", "latentlens", "--judge_threads", "2"] + base)
+    FakeOpenAI.broken = False
+    res = json.load(open(path))
+    assert [[p["interpretable"] for p in layer["patches"]] for layer in res] == before
+    parses = [p["judgment"].get("parse") for layer in res for p in layer["patches"][::2]]
+    assert {"free", "constrained"} <= set(parses), parses
+    assert os.path.exists(path.replace(".json", ".orig.json"))
+    df = R.main(["--stage", "summary"] + base)
     assert (df["unparsed"] == 0).all()
   print("\nLL PROTOCOL TEST PASSED")
 

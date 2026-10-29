@@ -134,6 +134,31 @@ def main(argv=None):
           + ", ".join(f"{kept[i]} {100 * share[i]:.0f}% ({counts[n][i]} entries)" for i in order)
           + f"; corr(log entries, share) {corr:+.2f}")
 
+  # 5. which contexts: the class word's position in its sentence, and the sentence's length
+  print("\n5. Matched entries by context (position of the class word; words in the sentence)")
+  for spec, (n, ro) in zip((args.ref, args.new), banks.items()):
+    meta_b = bank_metadata(spec.rsplit(":", 1)[0])
+    cols = np.load(os.path.join(args.out_dir, "scores", f"{n}_entries.npz"))["cols"]
+    pos = np.array([meta_b[j]["position"] for j in cols])
+    words = np.array([len(meta_b[j]["caption"].split()) for j in cols])
+    print(f"  {n}: position median {int(np.median(pos))}, sentence length median "
+          f"{int(np.median(words))} words")
+    for lo, hi in ((2, 4), (5, 9), (10, 10 ** 6)):
+      sel = torch.as_tensor(np.flatnonzero((pos >= lo) & (pos <= hi)), device=ro.device)
+      if len(sel):
+        show(f"{n} position {lo}-{hi if hi < 10 ** 6 else ''} ({len(sel)})", acc(ro, rows=sel))
+    dog = [j for j, c in zip(cols, ro.cls.cpu().numpy()) if class_names[c] == "dog"][:4]
+    for j in dog:
+      print(f"    dog @ {meta_b[j]['position']}: {meta_b[j]['caption'][:100]!r}")
+
+
+def bank_metadata(bank_dir):
+  """Entry metadata of a bank (identical for every layer; read from the first)."""
+  import glob
+  path = sorted(glob.glob(os.path.join(bank_dir, "layer_*", "embeddings_cache.pt"))
+                + glob.glob(os.path.join(bank_dir, "*", "layer_*", "embeddings_cache.pt")))[0]
+  return torch.load(path, map_location="cpu", weights_only=False, mmap=True)["metadata"]
+
 
 if __name__ == "__main__":
   main()
