@@ -32,8 +32,9 @@ Deviations from the paper (state them when reporting):
   * the judge is open-weight (default Qwen3-VL-30B-A3B-Instruct-FP8), not GPT-5; max_tokens is
     raised from 1000 so its reasoning is not cut off before the JSON, temperature 0
   * replies that are not valid JSON are repaired (missing / trailing commas, Python booleans),
-    else asked again once with the output constrained to their JSON fields; their parser
-    counts any such reply as not interpretable
+    else asked again with the output constrained to their JSON fields, and if the reasoning
+    loops, once more constrained with a repetition penalty (1.1) and the reasoning capped at
+    1500 characters; their parser counts any such reply as not interpretable
   * their validation split was drawn after dropping dead image URLs, which cannot be replayed;
     we draw it from the full list with their seed and skip dead URLs, so the images are a
     different random sample from the same distribution
@@ -99,6 +100,8 @@ def parse_args(argv=None):
   p.add_argument("--judge_model", default="Qwen/Qwen3-VL-30B-A3B-Instruct-FP8")
   p.add_argument("--judge_max_tokens", type=int, default=2048)
   p.add_argument("--judge_threads", type=int, default=4, help="rejudge: parallel requests")
+  p.add_argument("--rejudge_from_attempt", type=int, default=2,
+                 help="rejudge: first make_judgment attempt (0 free, 1 constrained, 2 short)")
   return p.parse_args(argv)
 
 
@@ -450,6 +453,17 @@ JUDGMENT_SCHEMA = {
                  "global_words"]}
 
 
+REASONING_CHARS = 1500
+REPETITION_PENALTY = 1.1
+
+
+def short_schema():
+  """JUDGMENT_SCHEMA with the reasoning capped, so a looping reply must close the JSON."""
+  props = dict(JUDGMENT_SCHEMA["properties"],
+               reasoning={"type": "string", "maxLength": REASONING_CHARS})
+  return dict(JUDGMENT_SCHEMA, properties=props)
+
+
 def parse_judgment(text):
   """Their parser (outermost {...} -> json.loads), then repairs for slips an open judge makes
   copying their output template, which has no commas after two of its fields: missing commas
@@ -471,11 +485,23 @@ def parse_judgment(text):
     return None
 
 
-def make_judgment(args, ev, client):
+def make_judgment(args, ev, client, first=0):
   """Their OpenRouter branch (chat.completions; image, prompt, crop) with more tokens, T=0 and a
-  forgiving parser. A reply that still does not parse is asked again once with the output
-  constrained to their JSON fields (vLLM structured output); if that fails too, it is kept as
-  their unparsed fallback (not interpretable) with the full reply in "raw"."""
+  forgiving parser. A reply that still does not parse is asked again with the output
+  constrained to their JSON fields (vLLM structured output), and if that fails too (greedy
+  decoding can loop in the reasoning until max_tokens), once more constrained with a
+  repetition penalty and the reasoning capped at REASONING_CHARS. A reply that never parses is
+  kept as their unparsed fallback (not interpretable) with every reply in "raw". `first` skips
+  the earlier attempts (rejudge: those already failed)."""
+  attempts = [
+      ("free", {}),
+      ("constrained", {"response_format": {"type": "json_schema", "json_schema": {
+          "name": "judgment", "schema": JUDGMENT_SCHEMA}}}),
+      ("constrained_short", {
+          "response_format": {"type": "json_schema", "json_schema": {
+              "name": "judgment", "schema": short_schema()}},
+          "extra_body": {"repetition_penalty": REPETITION_PENALTY}}),
+  ]
 
   def judgment(_, image_with_bbox, cropped_image, candidate_words, model="", api_provider=""):
     content = [{"type": "image_url", "image_url": {"url": ev.encode_image(image_with_bbox)}},
@@ -485,16 +511,14 @@ def make_judgment(args, ev, client):
       content.append({"type": "image_url",
                       "image_url": {"url": ev.encode_image(cropped_image)}})
     texts = []
-    for constrained in (False, True):
-      extra = {"response_format": {"type": "json_schema", "json_schema": {
-          "name": "judgment", "schema": JUDGMENT_SCHEMA}}} if constrained else {}
+    for label, extra in attempts[first:]:
       resp = client.chat.completions.create(
           model=args.judge_model, max_tokens=args.judge_max_tokens, temperature=0.0,
           messages=[{"role": "user", "content": content}], **extra)
       texts.append(resp.choices[0].message.content or "")
       out = parse_judgment(texts[-1])
       if out is not None:
-        out["parse"] = "constrained" if constrained else "free"
+        out["parse"] = label
         return out
     return {"interpretable": False, "concrete_words": [], "abstract_words": [],
             "global_words": [], "reasoning": f"{UNPARSED}: {texts[0][:200]}", "raw": texts}
@@ -522,13 +546,13 @@ def stage_judge(args):
 
 def stage_rejudge(args):
   """Judge again only the patches whose reply did not parse, with the same inputs their loop
-  built (image with the red 3x3 box, and the crop) and make_judgment's repairs. The original
-  results are kept as evaluation_results.orig.json."""
+  built (image with the red 3x3 box, and the crop), starting at make_judgment's last attempt
+  (--rejudge_from_attempt). The original results are kept as evaluation_results.orig.json."""
   from concurrent.futures import ThreadPoolExecutor
   from openai import OpenAI
   ev = ll_eval_module(args, "evaluate_interpretability")
   client = OpenAI(base_url=args.judge_url, api_key="EMPTY")
-  judgment = make_judgment(args, ev, client)
+  judgment = make_judgment(args, ev, client, first=args.rejudge_from_attempt)
   bbox_size = 3
   names = [args.readout] if args.readout else list(THEIRS) + list(OURS)
   for name in names:
@@ -568,7 +592,8 @@ def stage_rejudge(args):
                                          if layer["total_count"] else 0.0)
     write_json(path, res)
     print(f"{name}: " + ", ".join(f"{k} {outcome.count(k)}"
-                                  for k in ("free", "constrained", "failed")), flush=True)
+                                  for k in ("free", "constrained", "constrained_short",
+                                            "failed")), flush=True)
 
 
 # -------------------------------------------------------------------------------- summary

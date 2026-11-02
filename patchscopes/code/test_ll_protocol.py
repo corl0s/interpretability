@@ -49,14 +49,16 @@ def stub_torchvision():
 class FakeOpenAI:
   """Stands in for the vLLM server: 'interpretable' iff a candidate word starts with a letter.
   With broken = True, free replies copy their template's missing commas (odd calls) or are not
-  JSON at all (even calls); constrained replies (response_format) are always valid."""
+  JSON at all (even calls); constrained replies (response_format) are always valid. With
+  loops = True, every reply without a repetition penalty loops until it is cut off."""
   broken = False
+  loops = False
   calls = 0
 
   def __init__(self, **kw):
     self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self.create))
 
-  def create(self, model, messages, max_tokens, temperature, response_format=None):
+  def create(self, model, messages, max_tokens, temperature, response_format=None, **kw):
     text = next(c["text"] for c in messages[0]["content"] if c["type"] == "text")
     words = text.split("Here are the candidate words:")[1].split("###")[0]
     ok = any(ch.isalpha() for ch in words)
@@ -67,6 +69,8 @@ class FakeOpenAI:
       FakeOpenAI.calls += 1
       reply = (reply.replace('],\n    "abstract', ']\n    "abstract') if FakeOpenAI.calls % 2
                else "I cannot produce JSON {here")
+    if FakeOpenAI.loops and "repetition_penalty" not in kw.get("extra_body", {}):
+      reply = '{"reasoning": "' + "The word is not related. " * 50
     msg = types.SimpleNamespace(content="Thinking... " + reply)
     return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
 
@@ -177,7 +181,8 @@ def main():
         p["interpretable"] = False
     json.dump(res, open(path, "w"))
     FakeOpenAI.broken = True
-    R.main(["--stage", "rejudge", "--readout", "latentlens", "--judge_threads", "2"] + base)
+    R.main(["--stage", "rejudge", "--readout", "latentlens", "--judge_threads", "2",
+            "--rejudge_from_attempt", "0"] + base)
     FakeOpenAI.broken = False
     res = json.load(open(path))
     assert [[p["interpretable"] for p in layer["patches"]] for layer in res] == before
@@ -186,6 +191,20 @@ def main():
     assert os.path.exists(path.replace(".json", ".orig.json"))
     df = R.main(["--stage", "summary"] + base)
     assert (df["unparsed"] == 0).all()
+
+    # a judge that loops: only the short, penalised attempt parses (rejudge's default start)
+    for layer in res:
+      for p in layer["patches"][::2]:
+        p["judgment"] = {"reasoning": R.UNPARSED + ": ...", "concrete_words": []}
+        p["interpretable"] = False
+    json.dump(res, open(path, "w"))
+    FakeOpenAI.loops = True
+    R.main(["--stage", "rejudge", "--readout", "latentlens", "--judge_threads", "2"] + base)
+    FakeOpenAI.loops = False
+    res = json.load(open(path))
+    assert [[p["interpretable"] for p in layer["patches"]] for layer in res] == before
+    parses = {p["judgment"].get("parse") for layer in res for p in layer["patches"][::2]}
+    assert parses == {"constrained_short"}, parses
   print("\nLL PROTOCOL TEST PASSED")
 
 
