@@ -39,8 +39,8 @@ done
 echo "judge server up"
 
 for r in logitlens embeddinglens latentlens patchscopes selfie image_slot oracle; do
-  python run_ll_protocol.py --stage judge --out_dir $OUT --readout $r --judge_model $JUDGE \
-      > logs/ll_judge_$r.log 2>&1 &
+  python run_ll_protocol.py --stage $STAGE --out_dir $OUT --readout $r --judge_model $JUDGE \
+      > logs/ll_judge_${STAGE}_$r.log 2>&1 &
 done
 wait $(jobs -p | grep -v $SERVER) || true
 python run_ll_protocol.py --stage summary --out_dir $OUT
