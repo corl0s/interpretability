@@ -2,7 +2,8 @@
 # Causal check (Task 7) pilot: mask each image's object, restore its clean visual-token states at
 # one layer at a time, measure answer recovery, and compare with the saved readout scores
 # (causal_restore.py). Resumable: resubmit to continue.
-#   qsub job_causal_restore.sh
+#   qsub job_causal_restore.sh          (200 images; the first 50 are the pilot's, already done)
+#   qsub job_causal_restore.sh 50
 #$ -P mlresearch
 #$ -N causal_restore
 #$ -l gpus=1
@@ -20,4 +21,4 @@ cd /projectnb/mlresearch/vishnuav/interpretability/patchscopes/code
 
 python test_causal_restore.py
 python causal_restore.py --coco_dir /projectnb/mlresearch/vishnuav/coco \
-    --vtr_dir ./results/vtr_llava15 --n_images 50
+    --vtr_dir ./results/vtr_llava15 --n_images ${1:-200}

@@ -99,10 +99,11 @@ def test_summary():
 
     C.main(["--stage", "summarize", "--vtr_dir", vtr, "--readouts", "good,bad,missing"])
     cases = pd.read_csv(os.path.join(out, "cases.csv"), index_col=0)
-    # good: layer 0 A, layer 1 D -> agreement 1; bad: layer 0 C, layer 1 D -> 0.5
-    assert cases.loc["good", "agreement"] == 1.0 and cases.loc["good", "A"] == 0.5
-    assert cases.loc["bad", "C"] == 0.5 and cases.loc["bad", "agreement"] == 0.5
-    assert (cases["n"] == 4).all()  # 2 valid images x 2 layers
+    # good: layer 0 A, layer 1 D; bad: layer 0 C, layer 1 D
+    assert cases.loc["good", "A"] == 0.5 and cases.loc["bad", "C"] == 0.5
+    assert cases.loc["good", "hit_used"] == 1.0 and cases.loc["good", "hit_unused"] == 0.0
+    assert cases.loc["bad", "hit_used"] == 0.0 and cases.loc["bad", "hit_unused"] == 0.0
+    assert (cases["n"] == 4).all() and (cases["n_used"] == 2).all()  # 2 valid images x 2 layers
     curve = pd.read_csv(os.path.join(out, "curve.csv"))
     assert set(curve["mode"]) == {"object", "all_image"}
 

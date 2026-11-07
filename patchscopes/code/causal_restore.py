@@ -20,7 +20,8 @@ readout "decodes" the object at a layer when it ranks the true class first (fair
 least half of the object's cached tokens (coverage >= 0.5). The model "uses" the object tokens at
 that layer when recovery >= --used_threshold. Each (image, layer) is then one of
   A decodes and used      B decodes, not used      C used, not decoded      D neither
-and agreement = (A + D) / all.
+and each readout gets two hit rates: P(decodes | used) and P(decodes | not used). A readout that
+tracks what the model uses has the first high and the second low.
 
   python causal_restore.py --coco_dir /path/to/coco --vtr_dir ./results/vtr_llava15 --n_images 50
     -> <vtr_dir>/causal_restore/{images.csv, restores.csv, curve.csv, cases.csv, cases_by_layer.csv}
@@ -279,17 +280,21 @@ def readout_hits(vtr_dir, names, meta, class_names, kept, image_ids):
 
 
 def case_tables(restores, hits, used_threshold):
-  """(cases per readout, cases per readout and layer) on the object-mode restores."""
+  """(per readout, per readout and layer) on the object-mode restores: the A/B/C/D shares and
+  the two hit rates, P(decodes | used) and P(decodes | not used). (A + D alone would reward a
+  readout that never decodes, since late layers are almost all "not used".)"""
   r = restores[restores["mode"] == "object"][["image_id", "layer", "recovery"]]
   m = hits.merge(r, on=["image_id", "layer"])
-  dec, used = m["frac"] >= 0.5, m["recovery"] >= used_threshold
-  m["case"] = np.select([dec & used, dec & ~used, ~dec & used], ["A", "B", "C"], "D")
+  m["dec"], m["used"] = m["frac"] >= 0.5, m["recovery"] >= used_threshold
+  m["case"] = np.select([m.dec & m.used, m.dec & ~m.used, ~m.dec & m.used], ["A", "B", "C"], "D")
 
   def table(keys):
-    t = m.groupby(keys)["case"].value_counts(normalize=True).unstack(fill_value=0.0)
+    g = m.groupby(keys)
+    t = g["case"].value_counts(normalize=True).unstack(fill_value=0.0)
     t = t.reindex(columns=CASES, fill_value=0.0)
-    t["agreement"] = t["A"] + t["D"]
-    t["n"] = m.groupby(keys).size()
+    t["hit_used"] = m[m.used].groupby(keys)["dec"].mean()
+    t["hit_unused"] = m[~m.used].groupby(keys)["dec"].mean()
+    t["n_used"], t["n"] = m[m.used].groupby(keys).size(), g.size()
     return t
 
   return table(["readout"]), table(["readout", "layer"])
@@ -320,12 +325,17 @@ def stage_summarize(args, out_dir, data, kept):
   cases, by_layer = case_tables(restores, hits, args.used_threshold)
   cases.to_csv(os.path.join(out_dir, "cases.csv"))
   by_layer.to_csv(os.path.join(out_dir, "cases_by_layer.csv"))
-  print(f"\nCases over (image, layer), used = recovery >= {args.used_threshold}, decodes = top-1 "
-        "on >= half the object's tokens:")
+  print(f"\nOver (image, layer); used = recovery >= {args.used_threshold}, decodes = top-1 on >= "
+        "half the object's tokens:")
   print("  A decodes & used   B decodes, not used   C used, not decoded   D neither")
-  print(cases.round(2).to_string())
-  print("\nAgreement (A + D) by layer:")
-  print(by_layer["agreement"].unstack("layer").round(2).to_string())
+  print("  hit_used = P(decodes | used) (low: misses what the model uses)")
+  print("  hit_unused = P(decodes | not used) (high: reports what the model no longer uses)")
+  print(cases.sort_values("hit_used", ascending=False).round(2).to_string())
+  used_rate = by_layer.groupby("layer")["n_used"].first() / by_layer.groupby("layer")["n"].first()
+  decode = (by_layer["A"] + by_layer["B"]).unstack("layer")
+  decode.loc["(model uses: share of images)"] = used_rate.fillna(0.0)
+  print("\nDecode rate by layer, next to how often the model uses the object tokens:")
+  print(decode.round(2).to_string())
 
 
 def main(argv=None):
