@@ -108,10 +108,117 @@ def test_summary():
     assert set(curve["mode"]) == {"object", "all_image"}
 
 
+class Cycle:
+  """Stands in for a fitted probe: predicts classes 0, 1, 2, 0, ... over the rows."""
+
+  def predict(self, X):
+    return np.arange(len(X)) % len(KEPT)
+
+
+def test_square_mask():
+  m = np.zeros((100, 200), bool)
+  m[:, 100:] = True                       # right half; square crop keeps the middle 100 px
+  sq = C.square_mask(m)
+  assert sq.shape == (336, 336) and sq[:, 170:].all() and not sq[:, :166].any()
+  g = C.grid_coverage(sq).reshape(24, 24)
+  assert (g[:, 13:] == 1).all() and (g[:, :11] == 0).all()
+
+
+def test_fit_probes():
+  rng = np.random.RandomState(0)
+  with tempfile.TemporaryDirectory() as tmp:
+    meta = pd.DataFrame([{"image_id": i, "kind": "object", "coverage": 0.9,
+                          "class_name": KEPT[i % 3]} for i in range(12)])
+    states = torch.tensor(rng.randn(12, 2, 4), dtype=torch.float16)
+    states[:, :, 0] += torch.tensor([3.0 * (i % 3) for i in range(12)])[:, None]
+    torch.save({"states": states, "meta": meta}, os.path.join(tmp, "states.pt"))
+    probes = C.fit_probes(tmp, tmp, KEPT, [0, 1], [0, 1])
+    assert sorted(probes) == [0, 1]
+    assert set(probes[0].classes_) == {0, 1, 2}
+    again = C.fit_probes(tmp, tmp, KEPT, [0], [1])          # cached: [0] is a subset of [0, 1]
+    assert again[1] is not None and sorted(again) == [0, 1]
+
+
+def test_run_tiny():
+  """stage_run end to end on a tiny random LLaVA: every restore mode and both experiments."""
+  import train_oracle
+  from test_visual_object_identification import build_tiny_vlm
+  mt, _ = build_tiny_vlm()
+  rng = np.random.RandomState(0)
+  with tempfile.TemporaryDirectory() as tmp:
+    coco, vtr = os.path.join(tmp, "coco"), os.path.join(tmp, "vtr")
+    for d in ("annotations", "val2017"):
+      os.makedirs(os.path.join(coco, d))
+    os.makedirs(vtr)
+    images, anns, samples = [], [], []
+    for i in range(4):
+      Image.fromarray(rng.randint(0, 255, (336, 336, 3), dtype=np.uint8)).save(
+          os.path.join(coco, "val2017", f"{i}.jpg"))
+      x0 = 40 * i
+      images.append({"id": i, "file_name": f"{i}.jpg", "height": 336, "width": 336})
+      anns.append({"id": 100 + i, "image_id": i, "category_id": i % 3 + 1, "iscrowd": 0,
+                   "segmentation": [[x0, 40, x0 + 150, 40, x0 + 150, 200, x0, 200]],
+                   "area": 150.0 * 160})
+      samples.append({"image_id": i, "file_name": f"{i}.jpg", "class_name": KEPT[i % 3],
+                      "ann_id": 100 + i})
+    json.dump({"images": images, "annotations": anns,
+               "categories": [{"id": k + 1, "name": c, "supercategory": "x"}
+                              for k, c in enumerate(KEPT)]},
+              open(os.path.join(coco, "annotations", "instances_val2017.json"), "w"))
+    json.dump({"class_names": KEPT, "samples": samples}, open(os.path.join(vtr, "samples.json"), "w"))
+    train_oracle.load_model = lambda args: mt
+    C.fit_probes = lambda *a, **k: {l: Cycle() for l in range(4)}
+    out = os.path.join(vtr, "causal_restore")
+    C.main(["--stage", "run", "--coco_dir", coco, "--vtr_dir", vtr, "--n_images", "3",
+            "--device", "cpu", "--batch", "4",
+            "--modes", "object,all_image,context,decoded,undecoded,random_k",
+            "--token_layers", "0,1", "--experiments", "masked_read,paste", "--read_layers", "0,3"])
+    res = pd.read_csv(os.path.join(out, "restores.csv"))
+    assert res["image_id"].nunique() == 3
+    for m in ("object", "all_image", "context"):
+      assert sorted(res[res["mode"] == m]["layer"].unique()) == [0, 1, 2, 3]
+    per = res[res["layer"] == 0].pivot_table(index="image_id", columns="mode", values="n_tokens")
+    assert (per["object"] + per["context"] == 576).all() and (per["all_image"] == 576).all()
+    assert (per["decoded"] == per["undecoded"]).all() and (per["random_k"] == per["decoded"]).all()
+    assert set(res[res["mode"].isin(C.TOKEN_MODES)]["layer"]) == {0, 1}
+    reads = pd.read_csv(os.path.join(out, "reads.csv"))
+    mr = reads[reads["experiment"] == "masked_read"]
+    assert set(mr["image"]) == {"clean", "masked"} and set(mr["region"]) == {"object", "outside"}
+    assert set(mr["layer"]) == {0, 3} and set(mr["reader"]) == {"probe", "logit_lens"}
+    ps = reads[reads["experiment"] == "paste"]
+    assert set(ps["region"]) == {"object", "scene"} and ps["scene"].notna().all()
+    paste = pd.read_csv(os.path.join(out, "paste.csv"))
+    assert (paste["donor_class"] != paste["class_name"]).all() and len(paste) == 3
+    # rerun resumes (nothing left to do); the summaries read the new outputs
+    C.main(["--stage", "run", "--coco_dir", coco, "--vtr_dir", vtr, "--n_images", "3",
+            "--device", "cpu"])
+    assert len(pd.read_csv(os.path.join(out, "restores.csv"))) == len(res)
+    ids = set(res["image_id"])
+    C.summarize_tokens(out, res, 0)
+    C.summarize_reads(out, ids, ids)
+    assert os.path.exists(os.path.join(out, "tokens.csv"))
+    assert os.path.exists(os.path.join(out, "masked_read.csv"))
+    assert os.path.exists(os.path.join(out, "paste_read.csv"))
+    # an output directory from the older version is refused
+    old = os.path.join(tmp, "old")
+    os.makedirs(old)
+    pd.DataFrame({"image_id": [0], "mode": ["object"], "layer": [0], "p": [0.1], "top1": [False],
+                  "recovery": [0.0]}).to_csv(os.path.join(old, "restores.csv"), index=False)
+    try:
+      C.main(["--stage", "run", "--coco_dir", coco, "--vtr_dir", vtr, "--out_dir", old,
+              "--device", "cpu"])
+      raise AssertionError("old restores.csv must be refused")
+    except SystemExit:
+      pass
+
+
 def main():
   test_masking()
   test_hooks()
   test_summary()
+  test_square_mask()
+  test_fit_probes()
+  test_run_tiny()
   print("\nCAUSAL RESTORE TEST PASSED")
 
 

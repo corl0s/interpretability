@@ -28,6 +28,12 @@ Stages (run in this order; see job_ll_*.sh):
   rejudge     judge again only the patches whose reply did not parse (see make_judgment)
   summary     % interpretable per readout and layer (+ Wilson 95% CI, relation types)
 
+The same protocol on COCO-VTR images, where the objects are known (job_ll_coco.sh):
+  fetch_coco  copy the first --n_images benchmark images (fair classes) instead of fetch; then
+              extract, latentlens (LLaVA's bank from the PixMo run), plan, ours, judge as above
+  truth       judge vs COCO per judged patch: does the judge accept words that name the wrong
+              object? -> truth.csv, truth_summary.csv
+
 Deviations from the paper (state them when reporting):
   * the judge is open-weight (default Qwen3-VL-30B-A3B-Instruct-FP8), not GPT-5; max_tokens is
     raised from 1000 so its reasoning is not cut off before the JSON, temperature 0
@@ -73,8 +79,8 @@ def parse_args(argv=None):
   p = argparse.ArgumentParser(description=__doc__,
                               formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("--stage", required=True,
-                 choices=["fetch", "extract", "export_lm", "latentlens", "plan", "ours", "judge",
-                          "rejudge", "summary"])
+                 choices=["fetch", "fetch_coco", "extract", "export_lm", "latentlens", "plan",
+                          "ours", "judge", "rejudge", "summary", "truth"])
   p.add_argument("--out_dir", default="./results/ll_llava15")
   p.add_argument("--ll_repo", default="../../../external/latentlens",
                  help="clone of github.com/McGill-NLP/latentlens")
@@ -82,6 +88,11 @@ def parse_args(argv=None):
   p.add_argument("--device", default="cuda")
   p.add_argument("--dtype", default="float16")
   p.add_argument("--n_images", type=int, default=100)
+  # fetch_coco / truth: the protocol on COCO-VTR images, where the objects are known
+  p.add_argument("--coco_dir", default=None)
+  p.add_argument("--vtr_dir", default="./results/vtr_llava15", help="fetch_coco: its images")
+  p.add_argument("--box_coverage", type=float, default=0.25,
+                 help="truth: a class is in the judged 3x3 box if it covers this share of it")
   p.add_argument("--num_patches", type=int, default=100, help="judged patches per layer")
   # export_lm / latentlens
   p.add_argument("--lm_dir", default=None, help="default: <out_dir>/llava15_lm")
@@ -191,6 +202,122 @@ def stage_fetch(args):
     meta.append({"image_idx": idx, "image_url": row["image_url"], "caption": row["caption"]})
   write_json(paths(args)["meta"], meta)
   print(f"saved {len(meta)} images ({failed} URLs failed) to {paths(args)['images']}")
+
+
+def stage_fetch_coco(args):
+  """Their protocol on COCO-VTR images instead of PixMo-Cap: the first --n_images benchmark
+  images of fair classes, copied unchanged; `truth` then checks the judge against COCO."""
+  import shutil
+  from train_oracle import load_benchmark
+  from visual_object_identification import ensure_image
+  if not args.coco_dir:
+    raise SystemExit("--coco_dir is needed")
+  data, kept = load_benchmark(args.vtr_dir)
+  samples = [s for s in data["samples"] if s["class_name"] in kept][:args.n_images]
+  os.makedirs(paths(args)["images"], exist_ok=True)
+  meta = []
+  for idx, s in enumerate(samples):
+    shutil.copyfile(ensure_image(args.coco_dir, s["file_name"]), image_path(args, idx))
+    meta.append({"image_idx": idx, "coco_image_id": s["image_id"], "file_name": s["file_name"],
+                 "caption": ""})
+  write_json(paths(args)["meta"], meta)
+  print(f"copied {len(meta)} COCO-VTR images to {paths(args)['images']}")
+
+
+def named_classes(words, forms):
+  """COCO classes any candidate word (or two adjacent words, for 'traffic light') names."""
+  toks = [str(w).strip().lower() for w in words if str(w).strip()]
+  phrases = toks + [f"{a} {b}" for a, b in zip(toks, toks[1:])]
+  from train_oracle import names_class
+  return {c for c, fs in forms.items() if any(names_class(p, fs) for p in phrases)}
+
+
+def stage_truth(args):
+  """Judge vs COCO on a fetch_coco run. Per judged patch: the COCO classes in the judge's 3x3
+  box (union of each class's instances covering >= --box_coverage of the box; crowd regions
+  are not rasterised), the class covering >= half of it ("object patch"), and which classes the
+  5 candidate words name. A readout is right on an object patch if a word names a class in the
+  box; it names a wrong object if words name COCO classes but none in the box. Words that name
+  no COCO class (parts, attributes, stuff like "grass") cannot be checked this way."""
+  import pandas as pd
+  from visual_object_identification import ann_to_mask, ensure_annotations, patch_coverage
+  from vtr.data import load_coco
+  from vtr.readouts import class_forms
+  if not args.coco_dir:
+    raise SystemExit("--coco_dir is needed")
+  coco, cats, class_names = load_coco(ensure_annotations(args.coco_dir))
+  forms = class_forms(class_names, synonyms=True)
+  imgs = {im["id"]: im for im in coco["images"]}
+  by_image = defaultdict(list)
+  for a in coco["annotations"]:
+    by_image[a["image_id"]].append(a)
+  cov, present = {}, {}
+  for m in load_meta(args):
+    info, union = imgs[m["coco_image_id"]], {}
+    present[m["image_idx"]] = {cats[a["category_id"]]["name"] for a in by_image[info["id"]]}
+    for a in by_image[info["id"]]:
+      mk = ann_to_mask(a, info["height"], info["width"])
+      if mk is not None:
+        c = cats[a["category_id"]]["name"]
+        union[c] = union[c] | mk if c in union else mk
+    cov[m["image_idx"]] = {c: patch_coverage(mk) for c, mk in union.items()}
+  rows = []
+  for name in list(THEIRS) + list(OURS):
+    path = os.path.join(paths(args)["judge"], name, "evaluation_results.json")
+    if not os.path.exists(path):
+      continue
+    with open(path, encoding="utf-8") as f:
+      res = json.load(f)
+    for layer in res:
+      for p in layer["patches"]:
+        r, c, idx = p["patch_row"], p["patch_col"], p["image_idx"]
+        box = (slice(max(0, r - 1), r + 2), slice(max(0, c - 1), c + 2))
+        share = {k: float(v[box].mean()) for k, v in cov[idx].items()}
+        in_box = {k for k, v in share.items() if v >= args.box_coverage}
+        main = max(share, key=share.get) if share and max(share.values()) >= 0.5 else ""
+        said = named_classes(p["candidate_words"], forms)
+        concrete = named_classes(p["judgment"].get("concrete_words", []), forms)
+        rows.append({"readout": name, "layer": layer["layer"], "image_idx": idx, "row": r,
+                     "col": c, "interpretable": bool(p["interpretable"]),
+                     "unparsed": UNPARSED in str(p["judgment"].get("reasoning", "")),
+                     "box_classes": "|".join(sorted(in_box)), "box_main": main,
+                     "names_box": bool(said & in_box),
+                     "names_wrong": bool(said) and not (said & in_box),
+                     "names_absent": bool(said - present[idx]),
+                     "concrete_wrong": bool(concrete) and not (concrete & in_box),
+                     "words": "|".join(map(str, p["candidate_words"]))})
+  if not rows:
+    raise FileNotFoundError(f"no judge results under {paths(args)['judge']}")
+  df = pd.DataFrame(rows)
+  df.to_csv(os.path.join(args.out_dir, "truth.csv"), index=False)
+  obj = df[df["box_main"] != ""]
+  g = obj.groupby("readout")
+
+  def cond(mask_col, value_col="interpretable"):
+    return obj[obj[mask_col]].groupby("readout")[value_col].mean()
+
+  judged = obj[obj["interpretable"]].groupby("readout")
+  t = pd.DataFrame({
+      "object_patches": g.size(),
+      "judge_interpretable": g["interpretable"].mean(),
+      "names_box_object": g["names_box"].mean(),
+      "names_wrong_object": g["names_wrong"].mean(),
+      "judge_if_right": cond("names_box"),
+      "judge_if_wrong_object": cond("names_wrong"),
+      "wrong_among_judged": judged["names_wrong"].mean(),
+      "unverifiable_among_judged": judged.apply(lambda x: (~x["names_box"] & ~x["names_wrong"])
+                                                .mean()),
+      "judge_concrete_wrong": g["concrete_wrong"].mean()})
+  t.to_csv(os.path.join(args.out_dir, "truth_summary.csv"))
+  pd.set_option("display.width", 200)
+  print(f"Judge vs COCO on {len(obj)} judged object patches (a class covers >= half of the "
+        "3x3 box), all layers pooled:")
+  print("  names_*: candidate words name the box's object / only other COCO objects")
+  print("  judge_if_*: share the judge calls interpretable; *_among_judged: share of what the "
+        "judge accepted")
+  print((t * 100).round(1).assign(object_patches=t["object_patches"]).to_string())
+  print(f"\nSaved {os.path.join(args.out_dir, 'truth.csv')} and truth_summary.csv")
+  return t
 
 
 # -------------------------------------------------------------------------------- extract
@@ -682,7 +809,8 @@ def main(argv=None, mt=None):
           "export_lm": lambda: stage_export_lm(args, mt), "latentlens": lambda: stage_latentlens(args),
           "plan": lambda: stage_plan(args), "ours": lambda: stage_ours(args, mt),
           "judge": lambda: stage_judge(args), "rejudge": lambda: stage_rejudge(args),
-          "summary": lambda: stage_summary(args)}[args.stage]()
+          "summary": lambda: stage_summary(args), "fetch_coco": lambda: stage_fetch_coco(args),
+          "truth": lambda: stage_truth(args)}[args.stage]()
 
 
 if __name__ == "__main__":

@@ -114,8 +114,48 @@ def make_oracle(d, mt):
   set_lora(mt, False)
 
 
+def test_truth():
+  """truth: a patch on the dog whose words say "dog" is right, "car" (also in the image) is a
+  wrong object, and the judge's acceptance of each is counted."""
+  with tempfile.TemporaryDirectory() as tmp:
+    coco, out = os.path.join(tmp, "coco"), os.path.join(tmp, "out")
+    os.makedirs(os.path.join(coco, "annotations"))
+    sq = lambda x0, x1: [[x0, 0, x1, 0, x1, 336, x0, 336]]
+    json.dump({"images": [{"id": 7, "file_name": "7.jpg", "height": 336, "width": 336}],
+               "annotations": [
+                   {"id": 1, "image_id": 7, "category_id": 18, "iscrowd": 0, "area": 1.0,
+                    "segmentation": sq(0, 168)},
+                   {"id": 2, "image_id": 7, "category_id": 3, "iscrowd": 0, "area": 1.0,
+                    "segmentation": sq(168, 336)}],
+               "categories": [{"id": 18, "name": "dog", "supercategory": "animal"},
+                              {"id": 3, "name": "car", "supercategory": "vehicle"}]},
+              open(os.path.join(coco, "annotations", "instances_val2017.json"), "w"))
+    os.makedirs(os.path.join(out, "images"))
+    json.dump([{"image_idx": 0, "coco_image_id": 7, "file_name": "7.jpg", "caption": ""}],
+              open(os.path.join(out, "images", "images.json"), "w"))
+
+    def patch(words, ok, col=4):
+      return {"image_idx": 0, "patch_row": 10, "patch_col": col, "candidate_words": words,
+              "interpretable": ok,
+              "judgment": {"reasoning": "", "concrete_words": words[:1] if ok else []}}
+
+    res = [{"layer": 0, "patches": [patch(["dog", "fur", "a", "b", "c"], True),
+                                    patch(["car", "x", "y", "z", "w"], True),
+                                    patch(["grass", "x", "y", "z", "w"], False),
+                                    patch(["dogs", "x", "y", "z", "w"], False, col=20)]}]
+    os.makedirs(os.path.join(out, "judge", "logitlens"))
+    json.dump(res, open(os.path.join(out, "judge", "logitlens", "evaluation_results.json"), "w"))
+    t = R.main(["--stage", "truth", "--out_dir", out, "--coco_dir", coco, "--n_images", "1"])
+    row = t.loc["logitlens"]
+    assert row["object_patches"] == 4
+    assert row["names_box_object"] == 0.25 and row["names_wrong_object"] == 0.5
+    assert row["judge_if_right"] == 1.0 and row["judge_if_wrong_object"] == 0.5
+    assert row["wrong_among_judged"] == 0.5
+
+
 def main():
   stub_torchvision()
+  test_truth()
   import openai
   openai.OpenAI = FakeOpenAI
   R.LAYERS = (0, 1, 2, 4)  # the tiny model has 4 blocks
