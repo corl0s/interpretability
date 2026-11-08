@@ -374,7 +374,7 @@ def main(argv=None):
     print("Selecting COCO-VTR object samples ...")
     if args.same_images:
       with open(args.same_images, encoding="utf-8") as f:
-        previous = json.load(f)["samples"]
+        previous = json.load(f)["samples"][:args.n_images]
       samples, class_names = select_same_images(previous, ensure_annotations(args.coco_dir),
                                                 geometry, args.min_tokens)
       print(f"  reused {len(samples)} of {len(previous)} images from {args.same_images}")

@@ -24,7 +24,7 @@ Stages (run in this order; see job_ll_*.sh):
   ours        our readouts on the planned patches only: Patchscopes, SelfIE, image-slot
               injection, visual oracle (top-5 next tokens, raw, like their logit lens)
   judge       their evaluate_interpretability.py, with an open-weight judge behind an
-              OpenAI-compatible server (vLLM) instead of GPT-5
+              OpenAI-compatible server (vLLM) instead of GPT-5; resumes a partial run
   rejudge     judge again only the patches whose reply did not parse (see make_judgment)
   summary     % interpretable per readout and layer (+ Wilson 95% CI, relation types)
 
@@ -526,15 +526,41 @@ def make_judgment(args, ev, client, first=0):
   return judgment
 
 
+def resume_judgment(judgment, path):
+  """Their loop has no resume and rewrites evaluation_results.json from scratch, but its patch
+  sampling is seeded and never depends on the judge's replies, so a rerun asks about the same
+  patches in the same order: replay the saved judgments (checked against the candidate words)
+  and only ask the judge about the rest."""
+  saved = []
+  if os.path.exists(path):
+    with open(path, encoding="utf-8") as f:
+      saved = [p for layer in json.load(f) for p in layer["patches"]]
+  print(f"{path}: replaying {len(saved)} saved judgments", flush=True)
+  replay = iter(saved)
+
+  def resumed(client, image_with_bbox, cropped_image, candidate_words, **kw):
+    p = next(replay, None)
+    if p is None:
+      return judgment(client, image_with_bbox, cropped_image, candidate_words, **kw)
+    if p["candidate_words"] != list(candidate_words):
+      raise RuntimeError(f"{path} does not match this run's patches; move it away to start over")
+    return p["judgment"]
+
+  return resumed
+
+
 def stage_judge(args):
-  """Their judge loop unchanged, with the OpenAI client pointed at a local server."""
+  """Their judge loop unchanged, with the OpenAI client pointed at a local server; resumes from
+  a partial evaluation_results.json (resume_judgment)."""
   from openai import OpenAI
   ev = ll_eval_module(args, "evaluate_interpretability")
   client = OpenAI(base_url=args.judge_url, api_key="EMPTY")
   ev.OpenAI = lambda **kw: client
-  ev.get_llm_judgment = make_judgment(args, ev, client)
+  judgment = make_judgment(args, ev, client)
   names = [args.readout] if args.readout else list(THEIRS) + list(OURS)
   for name in names:
+    ev.get_llm_judgment = resume_judgment(
+        judgment, os.path.join(paths(args)["judge"], name, "evaluation_results.json"))
     ns = argparse.Namespace(
         api_key="EMPTY", api_provider="openrouter", api_model=args.judge_model,
         results_dir=readout_dir(args, name), images_dir=paths(args)["images"],

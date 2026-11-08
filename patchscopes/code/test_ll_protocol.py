@@ -54,11 +54,13 @@ class FakeOpenAI:
   broken = False
   loops = False
   calls = 0
+  created = 0
 
   def __init__(self, **kw):
     self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self.create))
 
   def create(self, model, messages, max_tokens, temperature, response_format=None, **kw):
+    FakeOpenAI.created += 1
     text = next(c["text"] for c in messages[0]["content"] if c["type"] == "text")
     words = text.split("Here are the candidate words:")[1].split("###")[0]
     ok = any(ch.isalpha() for ch in words)
@@ -205,6 +207,23 @@ def main():
     assert [[p["interpretable"] for p in layer["patches"]] for layer in res] == before
     parses = {p["judgment"].get("parse") for layer in res for p in layer["patches"][::2]}
     assert parses == {"constrained_short"}, parses
+
+    # judge resumes a run killed mid-way: saved judgments replayed, only the rest asked
+    full = json.load(open(path))
+    cut = full[:2] + [dict(full[2], patches=full[2]["patches"][:2])]
+    json.dump(cut, open(path, "w"))
+    FakeOpenAI.created = 0
+    R.main(["--stage", "judge", "--readout", "latentlens"] + base)
+    res = json.load(open(path))
+    assert FakeOpenAI.created == sum(len(layer["patches"]) for layer in full) - 2 * n_patch - 2
+    assert [[p["interpretable"] for p in layer["patches"]] for layer in res] == before
+    assert res[:2] == full[:2]  # replayed, not judged again
+    json.dump([dict(full[0], patches=full[0]["patches"][::-1])], open(path, "w"))
+    try:
+      R.main(["--stage", "judge", "--readout", "latentlens"] + base)
+      raise AssertionError("a judge file from other patches must not be replayed")
+    except RuntimeError:
+      pass
   print("\nLL PROTOCOL TEST PASSED")
 
 
