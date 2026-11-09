@@ -210,7 +210,7 @@ def examples(args, macros):
     cov = np.asarray(sample["coverage"])
     for t in np.flatnonzero(cov >= HIGH_COVERAGE):
       y, x = divmod(int(t), 24)
-      d.rectangle([x * 14, y * 14, x * 14 + 13, y * 14 + 13], fill=(42, 120, 214, 70))
+      d.rectangle([x * 14, y * 14, x * 14 + 13, y * 14 + 13], fill=(42, 120, 214, 120))
     y, x = divmod(int(m["token"]), 24)
     d.rectangle([x * 14 - 2, y * 14 - 2, x * 14 + 15, y * 14 + 15], outline=(217, 130, 43, 255),
                 width=4)
