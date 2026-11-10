@@ -66,6 +66,33 @@ def capture_qwen(mt, processor, image, geometry, verify=False):
   return states.to(keep).cpu()
 
 
+def chat_prompt(mt, question):
+  """The model's chat prompt with one image and the question, ending where the answer starts."""
+  if getattr(mt, "family", "llava") == "qwen2.5-vl":
+    return mt.processor.PROMPT.format(text=question)
+  return f"USER: <image>\n{question} ASSISTANT:"
+
+
+def image_token_id(mt):
+  if getattr(mt, "family", "llava") == "qwen2.5-vl":
+    return mt.processor.image_token_id
+  return mt.model.config.image_token_index
+
+
+def chat_inputs(mt, images, question):
+  """(inputs on device, first image position, number of image tokens) for a batch of images
+  with the same question. Every row must have the same number of image tokens."""
+  prompt = chat_prompt(mt, question)
+  x = mt.processor(images=list(images), text=[prompt] * len(images), return_tensors="pt")
+  x = {k: v.to(mt.device) for k, v in x.items()}
+  if getattr(mt, "family", "llava") == "llava":
+    x["pixel_values"] = x["pixel_values"].to(mt.model.dtype)
+  pos = (x["input_ids"][0] == image_token_id(mt)).nonzero(as_tuple=True)[0]
+  if len(pos) == 0 or pos[-1] - pos[0] + 1 != len(pos):
+    raise ValueError(f"expected contiguous image tokens, found {len(pos)}")
+  return x, int(pos[0]), len(pos)
+
+
 def capture_states(mt, processor, image, geometry, verify=False):
   if getattr(mt, "family", "llava") == "qwen2.5-vl":
     return capture_qwen(mt, processor, image, geometry, verify)

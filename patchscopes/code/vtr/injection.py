@@ -30,7 +30,7 @@ from PIL import Image
 
 from visual_object_identification import get_decoder
 from vtr.geometry import HIGH_COVERAGE
-from vtr.models import text_position_ids
+from vtr.models import chat_prompt, image_token_id, text_position_ids
 from vtr.readouts import PROMPTS, _scatter_max, placeholder_positions
 
 IMAGE_QUESTION = "What is the main object in this image? Answer with one word."
@@ -51,14 +51,15 @@ class InjectionReadout:
       self.pos = placeholder_positions(tok, self.inputs["input_ids"][0].tolist(), placeholder,
                                        "selfie")
     elif target == "image":
-      if getattr(mt, "family", "llava") != "llava":
-        raise NotImplementedError("image-slot injection is implemented for LLaVA only")
-      prompt, continuation = f"USER: <image>\n{question} ASSISTANT:", " {}"
+      # LLaVA answers after "ASSISTANT:" (a space starts the word); Qwen2.5-VL after
+      # "assistant\n". A 336 px grey image is 24x24 tokens in LLaVA and 12x12 in Qwen2.5-VL.
+      qwen = getattr(mt, "family", "llava") == "qwen2.5-vl"
+      prompt, continuation = chat_prompt(mt, question), "{}" if qwen else " {}"
       mean = tuple(int(255 * m) for m in mt.processor.image_processor.image_mean)
       grey = Image.new("RGB", (336, 336), mean)
       self.inputs = dict(mt.processor(images=grey, text=prompt, return_tensors="pt"))
       ids = self.inputs["input_ids"][0]
-      self.pos = (ids == mt.model.config.image_token_index).nonzero(as_tuple=True)[0].tolist()
+      self.pos = (ids == image_token_id(mt)).nonzero(as_tuple=True)[0].tolist()
       self.side = int(round(len(self.pos) ** 0.5))
       if self.side ** 2 != len(self.pos) or self.pos[-1] - self.pos[0] + 1 != len(self.pos):
         raise ValueError(f"expected a contiguous square image grid, found {len(self.pos)} tokens")

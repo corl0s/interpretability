@@ -265,6 +265,8 @@ def main(argv=None, mt=None):
     if mt is None:
       from general_utils import ModelAndTokenizer
       dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
+      if "qwen" in args.model_name.lower() and args.device.startswith("cuda"):
+        dtype = torch.bfloat16  # as in run_vtr.load_model
       mt = ModelAndTokenizer(args.model_name, torch_dtype=dtype, device=args.device)
     readouts = run_cells(args, mt, states, meta_rows, rows, coverage, class_names, sources,
                          targets, maps)

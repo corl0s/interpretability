@@ -71,8 +71,9 @@ from train_oracle import load_benchmark  # noqa: E402
 from visual_object_identification import (ann_to_mask, ensure_annotations, ensure_image,  # noqa: E402
                                           get_decoder, patch_coverage)
 from vtr import evaluate as E  # noqa: E402
-from vtr.geometry import HIGH_COVERAGE  # noqa: E402
+from vtr.geometry import HIGH_COVERAGE, Qwen25Geometry  # noqa: E402
 from vtr.injection import IMAGE_QUESTION  # noqa: E402
+from vtr.models import chat_inputs  # noqa: E402
 from vtr.oracle import GREY, class_scores, first_tokens, square_crop  # noqa: E402
 from vtr.readouts import class_forms  # noqa: E402
 
@@ -103,12 +104,39 @@ def parse_args(argv=None):
   p.add_argument("--min_gap", type=float, default=0.2, help="p_clean - p_masked for a valid image")
   p.add_argument("--used_threshold", type=float, default=0.5)
   p.add_argument("--readouts", default=",".join(READOUTS))
+  p.add_argument("--min_pixels", type=int, default=56 * 56, help="Qwen2.5-VL resize lower bound")
+  p.add_argument("--max_pixels", type=int, default=12845056,
+                 help="Qwen2.5-VL resize upper bound; use the value of the benchmark run "
+                      "(job_vtr_qwen.sh: 512 * 784)")
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   return p.parse_args(argv)
 
 
 # ---------------------------------------------------------------------------------- images
+
+
+class TokenGrid:
+  """How an image becomes the model's input image and which tokens a mask touches.
+
+  LLaVA-1.5: the 336 px centre crop (square_crop) and its 24x24 grid (patch_coverage).
+  Qwen2.5-VL: the whole image (the processor resizes it; no crop) and its rows x cols grid of
+  28 px cells (Qwen25Geometry), so masks are measured on the original image."""
+
+  def __init__(self, family, min_pixels=None, max_pixels=None):
+    self.qwen = family == "qwen2.5-vl"
+    bounds = {k: v for k, v in (("min_pixels", min_pixels), ("max_pixels", max_pixels))
+              if v is not None}
+    self.geometry = Qwen25Geometry(**bounds) if self.qwen else None
+
+  def model_image(self, image):
+    return image if self.qwen else square_crop(image)
+
+  def coverage(self, mask):
+    """Per-token coverage of a mask in original image coordinates, flattened."""
+    if self.qwen:
+      return self.geometry.coverage(mask)
+    return patch_coverage(mask).reshape(-1)
 
 
 def mask_object(image, mask, dilate):
@@ -173,23 +201,21 @@ def capture_image_states(layers, start, n_tokens, store):
 
 
 class Runner:
-  """First-answer-step class log-probs for the main-object question on one image, n copies."""
+  """First-answer-step class log-probs for the main-object question on one image, n copies.
+  LLaVA-1.5 or Qwen2.5-VL (vtr.models.chat_inputs builds either chat prompt)."""
 
   def __init__(self, mt, kept):
     self.mt, self.kept = mt, kept
     self.cls, self.ids = first_tokens(mt.tokenizer, kept, class_forms(kept, synonyms=False))
-    self.prompt = f"USER: <image>\n{IMAGE_QUESTION} ASSISTANT:"
     self.layers = get_decoder(mt).layers
+    self.n_tokens = mt.num_visual_tokens  # Qwen: set per image by inputs()
 
   def inputs(self, image, n):
-    x = self.mt.processor(images=[image] * n, text=[self.prompt] * n, return_tensors="pt")
-    x = {k: v.to(self.mt.device) for k, v in x.items()}
-    x["pixel_values"] = x["pixel_values"].to(self.mt.model.dtype)
-    ids = x["input_ids"][0]
-    pos = (ids == self.mt.model.config.image_token_index).nonzero(as_tuple=True)[0]
-    if len(pos) != self.mt.num_visual_tokens:
-      raise ValueError(f"expected {self.mt.num_visual_tokens} image tokens, found {len(pos)}")
-    return x, int(pos[0])
+    x, start, n_tokens = chat_inputs(self.mt, [image] * n, IMAGE_QUESTION)
+    if self.mt.num_visual_tokens and n_tokens != self.mt.num_visual_tokens:
+      raise ValueError(f"expected {self.mt.num_visual_tokens} image tokens, found {n_tokens}")
+    self.n_tokens = n_tokens
+    return x, start
 
   @torch.no_grad()
   def logp(self, x):
@@ -200,7 +226,7 @@ class Runner:
   def clean(self, image):
     x, start = self.inputs(image, 1)
     store = {}
-    with capture_image_states(self.layers, start, self.mt.num_visual_tokens, store):
+    with capture_image_states(self.layers, start, self.n_tokens, store):
       scores = self.logp(x)
     return scores[0], torch.stack([store[l] for l in range(len(self.layers))])
 
@@ -343,6 +369,11 @@ def stage_run(args, out_dir, data, kept):
   chosen = choose_images(data["samples"], kept, args.n_images, args.seed)
   mt = load_model(args)
   mt.model.eval()
+  if getattr(mt, "family", "llava") == "qwen2.5-vl":
+    mt.processor.set_pixel_bounds(args.min_pixels, args.max_pixels)
+    if experiments:
+      raise SystemExit("masked_read / paste use LLaVA's 336 px crop: run them on LLaVA only")
+  grid = TokenGrid(getattr(mt, "family", "llava"), args.min_pixels, args.max_pixels)
   runner = Runner(mt, kept)
   n_layers = len(runner.layers)
   layers = parse_layers(args.layers, n_layers)
@@ -359,7 +390,6 @@ def stage_run(args, out_dir, data, kept):
   done = set(pd.read_csv(img_path)["image_id"]) if os.path.exists(img_path) else set()
   print(f"  {len(chosen)} images, {len(layers)} layers, modes {modes}, experiments "
         f"{experiments}; {len(done)} already done")
-  every = np.arange(mt.num_visual_tokens)
   for k, s in enumerate(chosen):
     if s["image_id"] in done:
       continue
@@ -367,15 +397,19 @@ def stage_run(args, out_dir, data, kept):
     image = Image.open(ensure_image(args.coco_dir, s["file_name"])).convert("RGB")
     mask = ann_to_mask(anns[s["ann_id"]], image.height, image.width)
     masked_full, grown = mask_object(image, mask, args.dilate)
-    tokens = restore_positions(grown)
-    cov = patch_coverage(mask).reshape(-1)
+    tokens = np.flatnonzero(grid.coverage(grown) > 0)
+    cov = grid.coverage(mask)
     cand = np.flatnonzero(cov >= HIGH_COVERAGE)
-    clean_img, masked_img = square_crop(image), square_crop(masked_full)
+    clean_img, masked_img = grid.model_image(image), grid.model_image(masked_full)
     y = kept.index(s["class_name"])
     rng = np.random.RandomState(args.seed + int(s["image_id"]))
 
     clean_scores, clean_states = runner.clean(clean_img)
     masked_scores, masked_states = runner.clean(masked_img)
+    if clean_states.shape[1] != len(cov):
+      raise ValueError(f"image {s['image_id']}: {clean_states.shape[1]} image tokens but "
+                       f"{len(cov)} grid cells (check --min_pixels / --max_pixels)")
+    every = np.arange(len(cov))
     base = {"object": tokens, "all_image": every, "context": np.setdiff1d(every, tokens)}
     specs = [(m, l, base[m], {}) for m in modes if m in base for l in layers]
     if token_layers:

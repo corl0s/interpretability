@@ -159,6 +159,25 @@ def main():
         assert len(fast.pos) == 5
     print("patchscopes + selfie OK on Qwen (cached == full; M-RoPE text positions)")
 
+    from causal_restore import Runner, TokenGrid
+    import run_object_pruning as P
+    from vtr.injection import InjectionReadout
+    ro = InjectionReadout(mt, class_names, forms, "image", "cpu", rows_per_batch=4)
+    assert ro.side == 12 and len(ro.pos) == 144, (ro.side, len(ro.pos))  # 336 px grey image
+    raw, pmi = ro.scores(h, 1, [ro.slots("all")] * len(h))
+    assert raw.shape == (3, len(class_names)) and np.isfinite(raw).all()
+    assert not np.allclose(raw[0], ro.scores(h[1:2], 1, [ro.slots("all")])[0][0])
+    print("image-slot injection OK on Qwen (12x12 grey image)")
+
+    runner = Runner(mt, class_names)
+    grid = TokenGrid("qwen2.5-vl")
+    clean, st = runner.clean(image)
+    assert st.shape[:2] == (4, len(grid.coverage(np.zeros((image.height, image.width), bool))))
+    P.self_test(runner, image)
+    blocked = P.pruned_scores(runner, image, [(0, np.arange(st.shape[1]))], 1)
+    assert not np.allclose(blocked[0], clean, atol=1e-4)
+    print("causal Runner + attention knockout OK on Qwen")
+
     s = LogitLens(mt, class_names, forms, "cpu").scores(h)
     assert s.shape == (3, 3) and np.isfinite(s).all()
     assert EmbeddingLens(mt, class_names, forms, "cpu").scores(h).shape == (3, 3)

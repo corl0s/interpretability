@@ -19,8 +19,9 @@ Readout names in the outputs:
   *_t<L>_raw, *_t<L>_pmi             Patchscopes / SelfIE injected at fixed target layer L
                                      (--ps_target_layer L) instead of the source layer
   image_slot_raw, image_slot_pmi     image-slot injection (vtr/injection.py): the state in all
-                                     576 slots of a blank-image prompt; first-token scoring.
-                                     Target per source layer from --slot_target (LLaVA only)
+                                     image slots of a blank-image prompt; first-token scoring.
+                                     Target per source layer from --slot_target (LLaVA and
+                                     Qwen2.5-VL)
   oracle_raw, oracle_pmi             the visual activation oracle (train_oracle.py): image-slot
                                      injection with its trained LoRA, settings from its lora.pt
   slot_nn_<bank>_img_k<K>            image-slot injection read by LatentLens: the second pass's
@@ -281,7 +282,7 @@ def run_readouts(args, mt, states, meta, class_names, layers):
     from vtr.oracle import set_lora
     set_lora(mt, False)  # plain model, even if a LoRA is attached
     targets = slot_targets(args, layers)
-    print(f"Readout: image_slot (all 576 slots; target per source {targets})")
+    print(f"Readout: image_slot (all image slots; target per source {targets})")
     ro = InjectionReadout(mt, class_names, plain, "image", args.device,
                           rows_per_batch=args.slot_rows_per_batch)
     injection("image_slot", lambda h, l, ro=ro: ro.scores(
