@@ -60,6 +60,9 @@ def parse_args(argv=None):
   p.add_argument("--batch", type=int, default=8)
   p.add_argument("--min_pixels", type=int, default=56 * 56)
   p.add_argument("--max_pixels", type=int, default=12845056)
+  p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"],
+                 help="float32: the knockout mask does not change the attention kernel's "
+                      "rounding (bf16 failed the self-test on SCC, max |diff| 0.10)")
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   return p.parse_args(argv)
@@ -139,11 +142,17 @@ def pruned_scores(runner, image, jobs, batch):
 
 
 def self_test(runner, image):
+  """With nothing blocked the hooked run must equal the unhooked run at the same batch size.
+  Batching alone (batch 2 vs 1) is reported as the numerical noise floor."""
   clean, _ = runner.clean(image)
+  x, _ = runner.inputs(image, 2)
+  batched = runner.logp(x)
   hooked = pruned_scores(runner, image, [(0, np.array([], int)), (None, np.array([0]))], 2)
-  ok = np.allclose(hooked, clean[None], atol=0.05)
-  print(f"  self-test: nothing blocked reproduces the clean run: {ok} "
-        f"(max |diff| {np.abs(hooked - clean[None]).max():.4f})")
+  noise = np.abs(batched - clean[None]).max()
+  diff = np.abs(hooked - batched).max()
+  ok = diff < 0.05
+  print(f"  self-test: nothing blocked reproduces the unhooked run: {ok} "
+        f"(max |diff| {diff:.4f}; batching alone {noise:.4f})")
   if not ok:
     raise SystemExit("the attention-mask hook changes the clean run: check the attention "
                      "implementation (eager or sdpa) and the transformers version")
@@ -151,7 +160,12 @@ def self_test(runner, image):
 
 def stage_run(args, out_dir, data, kept):
   chosen = choose_images(data["samples"], kept, args.n_images, args.seed)
-  mt = load_model(args)
+  if args.dtype == "float32":  # bf16 kernels differ with and without an explicit mask
+    from general_utils import ModelAndTokenizer
+    print(f"Loading {args.model_name} (torch.float32) ...")
+    mt = ModelAndTokenizer(args.model_name, torch_dtype=torch.float32, device=args.device)
+  else:
+    mt = load_model(args)
   mt.model.eval()
   family = getattr(mt, "family", "llava")
   if family == "qwen2.5-vl":

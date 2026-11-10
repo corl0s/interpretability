@@ -51,6 +51,6 @@ case "$2" in
         --readouts logit_lens,embedding_lens,patchscopes_pmi,selfie_pmi,image_slot_pmi,probe_linear ;;
   pruning)
     python run_object_pruning.py --coco_dir $COCO --vtr_dir $VTR --model_name $MODEL $PIX \
-        --n_images 200 --after $AFTER ;;
+        --n_images 200 --after $AFTER --batch 4 ;;  # float32
   *) echo "usage: qsub job_extend.sh qwen|13b proto|slot|causal|pruning"; exit 1 ;;
 esac

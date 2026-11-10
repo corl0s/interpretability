@@ -38,6 +38,7 @@ hook and the sink dimensions are LLaVA's).
 import argparse
 import glob
 import os
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -131,7 +132,11 @@ def capture(mt, image):
 
   handles = [layers[0].register_forward_pre_hook(pre, with_kwargs=True)]
   handles += [l.register_forward_hook(out_hook(k)) for k, l in enumerate(layers)]
-  handles.append(mt.vision_tower.vision_model.encoder.layers[-1].register_forward_hook(vit_hook))
+  # The CLIP layers' path differs across transformers versions (vision_model.encoder.layers in
+  # 4.x); find the last one by name.
+  vit_layers = [m for n, m in mt.vision_tower.named_modules()
+                if re.match(r".*encoder\.layers\.\d+$", n)]
+  handles.append(vit_layers[-1].register_forward_hook(vit_hook))
   try:
     mt.model(**x, use_cache=False)
   finally:
