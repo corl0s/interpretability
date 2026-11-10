@@ -88,6 +88,19 @@ def test_mentions():
   assert "dog" not in H.find_mentions("A hot dog on a plate.", forms)
 
 
+def test_no_blank_class_token():
+  """LLaMA encodes " Car" as ["▁", "▁Car"]: the bare "▁" must not become a class token."""
+  from transformers import AutoTokenizer
+  from visual_object_identification import class_token_ids
+  from vtr.readouts import SURFACE_FORMS, class_forms
+  tok = AutoTokenizer.from_pretrained("llava-hf/llava-1.5-7b-hf")
+  forms = class_forms(sorted(SURFACE_FORMS), synonyms=True)
+  for c, fs in forms.items():
+    for f in fs:
+      for t in class_token_ids(tok, f):
+        assert tok.decode([t]).strip(), (c, f, tok.convert_ids_to_tokens(t))
+
+
 if __name__ == "__main__":
   for name, fn in list(globals().items()):
     if name.startswith("test_"):

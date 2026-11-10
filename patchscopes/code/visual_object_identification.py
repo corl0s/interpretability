@@ -190,10 +190,14 @@ def select_samples(ann_path, n_images, min_area, max_area, min_object_patches,
 
 
 def class_token_ids(tokenizer, name):
-  """First-subtoken ids for a class name, across the casing/leading-space variants."""
+  """First-subtoken ids for a class name, across the casing/leading-space variants.
+
+  Tokens that decode to whitespace only are skipped: LLaMA's tokenizer encodes " Car" as
+  ["▁", "▁Car"], and the bare "▁" would otherwise be a first sub-token of most classes."""
   ids = set()
   for variant in (name, " " + name, name.capitalize(), " " + name.capitalize()):
-    toks = tokenizer.encode(variant, add_special_tokens=False)
+    toks = [t for t in tokenizer.encode(variant, add_special_tokens=False)
+            if tokenizer.decode([t]).strip()]
     if toks:
       ids.add(toks[0])
   return ids
