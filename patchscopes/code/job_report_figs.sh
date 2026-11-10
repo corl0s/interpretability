@@ -17,4 +17,5 @@ conda activate patchscopes
 cd /projectnb/mlresearch/vishnuav/interpretability/patchscopes/code
 
 python make_report_figures.py --coco_dir /projectnb/mlresearch/vishnuav/coco \
-    --vtr_dir ./results/vtr_llava15 --out_dir ./results/report ${1:+--image_ids $1}
+    --vtr_dir ./results/vtr_llava15 --out_dir ./results/report ${1:+--image_ids $1} \
+    --causal_dir ./results/vtr_llava15/causal_fixed  # after the class-token fix
