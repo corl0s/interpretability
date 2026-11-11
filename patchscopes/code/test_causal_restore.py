@@ -199,6 +199,21 @@ def test_run_tiny():
     assert os.path.exists(os.path.join(out, "tokens.csv"))
     assert os.path.exists(os.path.join(out, "masked_read.csv"))
     assert os.path.exists(os.path.join(out, "paste_read.csv"))
+    # every question preset runs; yes/no answers are scored over no/yes
+    for q in C.QUESTIONS:
+      qdir = os.path.join(tmp, "q_" + q)
+      C.main(["--stage", "run", "--coco_dir", coco, "--vtr_dir", vtr, "--out_dir", qdir,
+              "--n_images", "2", "--device", "cpu", "--modes", "object", "--question", q])
+      qres = pd.read_csv(os.path.join(qdir, "restores.csv"))
+      assert sorted(qres["layer"].unique()) == [0, 1, 2, 3] and (qres["p"] <= 1).all()
+      ans = set(pd.read_csv(os.path.join(qdir, "images.csv"))["masked_answer"])
+      assert ans <= ({"no", "yes"} if q == "yesno" else set(KEPT))
+    r = C.Runner(mt, KEPT, "yesno")
+    r.set_class("car")
+    assert r.text == "Is there a car in this image? Answer yes or no." and r.target("car") == 1
+    r = C.Runner(mt, ["apple"], "describe")
+    r.set_class("apple")
+    assert r.start_text == "The image shows an" and r.target("apple") == 0
     # an output directory from the older version is refused
     old = os.path.join(tmp, "old")
     os.makedirs(old)

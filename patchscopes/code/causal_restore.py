@@ -80,6 +80,16 @@ from vtr.readouts import class_forms  # noqa: E402
 READOUTS = ["logit_lens", "embedding_lens", "latentlens", "patchscopes_pmi", "selfie_pmi",
             "image_slot_pmi", "oracle_pmi", "probe_linear"]
 CASES = ["A", "B", "C", "D"]
+# --question presets: (question, forced answer start, scoring). {a} is "a"/"an" and {cls} the
+# image's class. "class" scores the next token over the class names; "yesno" scores
+# P(yes) / (P(yes) + P(no)). The text follows the image, so the visual states are the same
+# under every question; only how the answer uses them can change.
+QUESTIONS = {
+    "main": (IMAGE_QUESTION, "", "class"),
+    "photo": ("What is this a photo of? Answer with one word.", "", "class"),
+    "describe": ("Describe the image.", "The image shows {a}", "class"),
+    "yesno": ("Is there {a} {cls} in this image? Answer yes or no.", "", "yesno"),
+}
 TOKEN_MODES = ("decoded", "undecoded", "random_k")
 
 
@@ -108,6 +118,8 @@ def parse_args(argv=None):
   p.add_argument("--max_pixels", type=int, default=12845056,
                  help="Qwen2.5-VL resize upper bound; use the value of the benchmark run "
                       "(job_vtr_qwen.sh: 512 * 784)")
+  p.add_argument("--question", default="main", choices=list(QUESTIONS),
+                 help="question asked about the image (see QUESTIONS)")
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   return p.parse_args(argv)
@@ -204,14 +216,28 @@ class Runner:
   """First-answer-step class log-probs for the main-object question on one image, n copies.
   LLaVA-1.5 or Qwen2.5-VL (vtr.models.chat_inputs builds either chat prompt)."""
 
-  def __init__(self, mt, kept):
+  def __init__(self, mt, kept, question="main"):
     self.mt, self.kept = mt, kept
+    self.question, self.prefix, self.score = QUESTIONS[question]
     self.cls, self.ids = first_tokens(mt.tokenizer, kept, class_forms(kept, synonyms=False))
+    if self.score == "yesno":  # column 0: no, column 1: yes
+      words = (("no",), ("yes",))
+      self.cls, self.ids = first_tokens(mt.tokenizer, [0, 1], dict(enumerate(words)))
     self.layers = get_decoder(mt).layers
     self.n_tokens = mt.num_visual_tokens  # Qwen: set per image by inputs()
+    self.set_class(kept[0])
+
+  def set_class(self, name):
+    """Fill {a}/{cls} in the question for the current image's class."""
+    fill = {"a": "an" if name[0] in "aeiou" else "a", "cls": name}
+    self.text, self.start_text = self.question.format(**fill), self.prefix.format(**fill)
+
+  def target(self, name):
+    """Column of the right answer in logp()'s scores."""
+    return 1 if self.score == "yesno" else self.kept.index(name)
 
   def inputs(self, image, n):
-    x, start, n_tokens = chat_inputs(self.mt, [image] * n, IMAGE_QUESTION)
+    x, start, n_tokens = chat_inputs(self.mt, [image] * n, self.text, self.start_text)
     if self.mt.num_visual_tokens and n_tokens != self.mt.num_visual_tokens:
       raise ValueError(f"expected {self.mt.num_visual_tokens} image tokens, found {n_tokens}")
     self.n_tokens = n_tokens
@@ -221,6 +247,9 @@ class Runner:
   def logp(self, x):
     out = self.mt.model(**x, use_cache=False)
     logp = out.logits[:, -1].float().log_softmax(-1).cpu()
+    if self.score == "yesno":  # [n, 2], renormalised over no/yes
+      s = torch.from_numpy(class_scores(logp, self.cls, self.ids, 2))
+      return (s - s.logsumexp(-1, keepdim=True)).numpy()
     return class_scores(logp, self.cls, self.ids, len(self.kept))  # [n, n_kept]
 
   def clean(self, image):
@@ -373,8 +402,12 @@ def stage_run(args, out_dir, data, kept):
     mt.processor.set_pixel_bounds(args.min_pixels, args.max_pixels)
     if experiments:
       raise SystemExit("masked_read / paste use LLaVA's 336 px crop: run them on LLaVA only")
+  if experiments and args.question != "main":
+    raise SystemExit("masked_read / paste assume the main-object question")
   grid = TokenGrid(getattr(mt, "family", "llava"), args.min_pixels, args.max_pixels)
-  runner = Runner(mt, kept)
+  runner = Runner(mt, kept, args.question)
+  print(f"  question: {runner.question!r}, answer start {runner.prefix!r}, scored as "
+        f"{runner.score}")
   n_layers = len(runner.layers)
   layers = parse_layers(args.layers, n_layers)
   token_layers = parse_layers(args.token_layers, n_layers) if set(modes) & set(TOKEN_MODES) else []
@@ -401,7 +434,8 @@ def stage_run(args, out_dir, data, kept):
     cov = grid.coverage(mask)
     cand = np.flatnonzero(cov >= HIGH_COVERAGE)
     clean_img, masked_img = grid.model_image(image), grid.model_image(masked_full)
-    y = kept.index(s["class_name"])
+    runner.set_class(s["class_name"])
+    y = runner.target(s["class_name"])
     rng = np.random.RandomState(args.seed + int(s["image_id"]))
 
     clean_scores, clean_states = runner.clean(clean_img)
@@ -413,7 +447,8 @@ def stage_run(args, out_dir, data, kept):
     base = {"object": tokens, "all_image": every, "context": np.setdiff1d(every, tokens)}
     specs = [(m, l, base[m], {}) for m in modes if m in base for l in layers]
     if token_layers:
-      specs += token_restores(probes, clean_states, cand, y, token_layers, rng)
+      specs += token_restores(probes, clean_states, cand, kept.index(s["class_name"]),
+                              token_layers, rng)
     jobs = [(l, torch.as_tensor(tok, device=mt.device)) for _, l, tok, _ in specs]
     rest = runner.restored(masked_img, clean_states, jobs, args.batch) if jobs else []
 
@@ -458,7 +493,8 @@ def stage_run(args, out_dir, data, kept):
                        "n_restored": len(tokens), "p_clean": float(p_c), "p_masked": float(p_m),
                        "top1_clean": bool(clean_scores.argmax() == y),
                        "top1_masked": bool(masked_scores.argmax() == y),
-                       "masked_answer": kept[int(masked_scores.argmax())]}])
+                       "masked_answer": (("no", "yes") if runner.score == "yesno"
+                                         else kept)[int(masked_scores.argmax())]}])
     print(f"  [{k + 1}/{len(chosen)}] {s['class_name']}: p clean {p_c:.2f} masked {p_m:.2f}, "
           f"{len(tokens)} tokens ({time.time() - t0:.0f}s)", flush=True)
 

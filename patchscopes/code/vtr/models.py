@@ -66,11 +66,12 @@ def capture_qwen(mt, processor, image, geometry, verify=False):
   return states.to(keep).cpu()
 
 
-def chat_prompt(mt, question):
-  """The model's chat prompt with one image and the question, ending where the answer starts."""
+def chat_prompt(mt, question, prefix=""):
+  """The model's chat prompt with one image and the question, ending where the answer starts
+  (or after `prefix`, a forced start of the answer)."""
   if getattr(mt, "family", "llava") == "qwen2.5-vl":
-    return mt.processor.PROMPT.format(text=question)
-  return f"USER: <image>\n{question} ASSISTANT:"
+    return mt.processor.PROMPT.format(text=question) + prefix
+  return f"USER: <image>\n{question} ASSISTANT:" + (" " + prefix if prefix else "")
 
 
 def image_token_id(mt):
@@ -79,10 +80,10 @@ def image_token_id(mt):
   return mt.model.config.image_token_index
 
 
-def chat_inputs(mt, images, question):
+def chat_inputs(mt, images, question, prefix=""):
   """(inputs on device, first image position, number of image tokens) for a batch of images
   with the same question. Every row must have the same number of image tokens."""
-  prompt = chat_prompt(mt, question)
+  prompt = chat_prompt(mt, question, prefix)
   x = mt.processor(images=list(images), text=[prompt] * len(images), return_tensors="pt")
   x = {k: v.to(mt.device) for k, v in x.items()}
   if getattr(mt, "family", "llava") == "llava":
