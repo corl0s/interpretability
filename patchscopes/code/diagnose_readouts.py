@@ -108,8 +108,13 @@ def image_refs(args, samples, geometry):
 def edge_distance(sample):
   """Per token: distance (in tokens) to the nearest token the object does not touch."""
   from scipy.ndimage import distance_transform_edt
-  rows, cols = sample["grid"]
-  inside = np.asarray(sample["coverage"]).reshape(rows, cols) > 0
+  cov = np.asarray(sample["coverage"])
+  if "grid" in sample:
+    rows, cols = sample["grid"]
+  else:  # older caches (LLaVA run) predate the "grid" field: square grid, 24x24 for LLaVA
+    rows = cols = int(round(np.sqrt(cov.size)))
+    assert rows * cols == cov.size, f"cannot infer grid from {cov.size} tokens"
+  inside = cov.reshape(rows, cols) > 0
   return distance_transform_edt(inside).reshape(-1)
 
 
